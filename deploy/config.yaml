@@ -140,13 +140,13 @@ cameras:
     name: "ST_FX_DO_WE_2168"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua2168"
     enabled: true
-    active_rules: ["no_vest", "smoking"]
+    active_rules: [ "smoking"]
   
   - id: "2172"
     name: "ST_FX_DO_WE_2172"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua2172"
     enabled: true
-    active_rules: ["no_vest", "smoking"]
+    active_rules: [ "smoking"]
 
   # ppe + smoking SWH 2026.9.10
   - id: "1824"

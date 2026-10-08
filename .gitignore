@@ -9,3 +9,4 @@ tmp
 alerts
 logs
 .opencode
+*.tar.gz
