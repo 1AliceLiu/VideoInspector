@@ -191,6 +191,18 @@ cameras:
     enabled: true
     active_rules: ["smoking"]
 
+  - id: "1918"
+    name: "Cam 4 - Portion 14 柏力 Carpark (1918)"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1002660"
+    enabled: true
+    active_rules: ["smoking"]
+
+  - id: "1485"
+    name: "P6 Viaduct (Visible)"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001505"
+    enabled: true
+    active_rules: ["smoking"]
+
 # -----------------------------------------------------------------------------
 # RTSP 输入
 # -----------------------------------------------------------------------------
