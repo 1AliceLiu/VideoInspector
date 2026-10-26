@@ -207,7 +207,7 @@ cameras:
     name: "AI Camera0670"
     rtsp_url: "rtsp://118.140.130.26:8554/dahua1005322"
     enabled: true
-    active_rules: ["no_vest"]
+    active_rules: ["no_vest","no_helmet"]
 
 # -----------------------------------------------------------------------------
 # RTSP 输入
