@@ -227,7 +227,7 @@ cameras:
 
   - id: "670"
     name: "AI Camera0670"
-    rtsp_url: "rtsp://118.140.130.26:8554/dahua1005322"
+    rtsp_url: "rtsp://192.168.1.16:9090/dss/monitor/params?cameraid=1005322%240&substream=1"
     enabled: true
     active_rules: ["no_vest","no_helmet"]
 
