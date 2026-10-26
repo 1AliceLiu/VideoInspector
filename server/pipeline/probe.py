@@ -27,8 +27,18 @@ nvosd 经验值：违规框 border_width 实测 2 不上屏、4 起正常渲染�
 模型拓扑来自 config（model.gies + rules），探针不再硬编码任何 uid/规则名：
   - detector（如 helmet）：整帧检测器，空间关联（检测框中心落在 person 框内且
     label == violation）→ 违规
-  - classifier（如 harness/vest）：读 person 对象上的 NvDsClassifierMeta，label == violation → 违规
+  - classifier（如 harness/vest）：读 person 对象上的 NvDsClassifierMeta，label ==
+    violation → 违规
   - 违规翻译为 AttributeMeta(rule_name)，rule_name 即 alert_type。
+
+空间作用域（zones）与命中语义（trigger）:
+  - 规则带 zones 时，**区域门挂在属性上**：violation 型先判违规、再要求人员锚点落在
+    区域内，否则丢弃该属性；未带 zones = 全图判定（现有 PPE 算法的默认形态）。
+  - trigger=presence（区域入侵）不看任何违规属性，「区域内出现人员」本身即命中，
+    置信度取 person 检出分；该型规则必须绑定区域，由 validate_config 在启动期拦截。
+  - 区域判定复用 person 检出结果，**不新增任何模型推理**；GPU 开销与全图判定一致，
+    变的只是「哪些命中进入告警状态机」。
+  - 锚点默认 feet（底边中点）；归一化坐标 → 像素由 mux 尺寸换算（见 alert/regions）。
 
 约束（与旧版一致）:
   - 本探针在 GStreamer 流线程运行，只做轻量决策；JPEG/base64/HTTP 由 AlertManager
@@ -46,7 +56,8 @@ from loguru import logger
 
 from server.metadata import AttributeMeta, ObjectMeta
 from server.model_spec import KIND_CLASSIFIER, KIND_DETECTOR
-from server.alert.rules import RuleConfig
+from server.alert.rules import RuleConfig, TRIGGER_PRESENCE
+from server.alert.regions import ZoneMatcher, anchor_point
 
 RED = osd.Color(1.0, 0.0, 0.0, 1.0)    # 违规（唯一上屏色）
 
@@ -81,7 +92,10 @@ class SafetyProbe(BatchMetadataOperator):
                  person_uid: int = 1,
                  person_conf_threshold: float = 0.6,
                  active_rules_by_source: dict[int, set[str]] | None = None,
-                 health=None):
+                 health=None,
+                 mux_width: int = 1920,
+                 mux_height: int = 1080,
+                 log_out_of_zone: bool = False):
         super().__init__()
         self._managers = alert_managers
         self._executor = executor
@@ -93,16 +107,43 @@ class SafetyProbe(BatchMetadataOperator):
         self._person_conf_threshold = person_conf_threshold
         self._active_rules_by_source = active_rules_by_source or {}
         self._all_rules = set(self._rules)
+        # 区域标定期排障开关：记录「违规成立但人在区域外被淘汰」的命中。
+        # 默认关闭（热路径零开销）；配了区域的路上打开，可现场确认
+        # 「不报」到底是模型没检出，还是检出后被区域门挡下。
+        self._log_out_of_zone = log_out_of_zone
 
         # 预解析: rule → gie 规格（uid / kind / violation）
         # detector 与 classifier 分桶，热路径免查 kind。
         self._rule_binding: dict[str, tuple] = {}   # rule_name -> (uid, kind, violation)
         self._known_labels: set[str] = set()
+        # 区域命中器（rule → ZoneMatcher）与 presence 型规则集合：
+        #   - 有 zones 的规则才建 matcher（无 zones = 全图，不进区域判定，零开销）
+        #   - presence 型只看「区域内有没有人」，不看任何违规属性
+        self._matchers: dict[str, ZoneMatcher] = {}
+        self._presence_rules: set[str] = set()
         for rule_name, rule in self._rules.items():
             spec = self._gies[rule.gie]
             self._rule_binding[rule_name] = (spec.uid, spec.kind, spec.violation)
             if spec.violation:
                 self._known_labels.add(spec.violation)
+            if rule.trigger == TRIGGER_PRESENCE and rule.zones:
+                self._presence_rules.add(rule_name)
+            if rule.zones:
+                self._matchers[rule_name] = ZoneMatcher(rule.zones,
+                                                        mux_width, mux_height)
+            if rule.trigger == TRIGGER_PRESENCE and not rule.zones:
+                # 两种情形要分开说，否则启动日志会误导排障：
+                #   ① 模板规则（尚未有摄像头绑定区域）→ 正常，等导入器补上
+                #   ② 已被某路 active_rules 引用却没区域 → 配置有问题（validate_config
+                #      本应在启动期拦住，走到这里说明有旁路），该规则全程不命中
+                referenced = (set().union(*self._active_rules_by_source.values())
+                              if self._active_rules_by_source else self._all_rules)
+                if rule_name in referenced:
+                    logger.warning("规则 {} 是 presence 型但被摄像头引用且未绑定区域，"
+                                   "本次启动全程不生效（区域入侵未标定？）", rule_name)
+                else:
+                    logger.info("规则 {} 是 presence 模板，暂未绑定区域且未被任何路引用"
+                                "（标定后即生效）", rule_name)
 
     def handle_metadata(self, batch_meta):
         health_record = self._health.record if self._health is not None else None
@@ -114,8 +155,11 @@ class SafetyProbe(BatchMetadataOperator):
 
             active_detector_uids: set[int] = set()
             for rule_name in active:
-                uid, kind, _ = self._rule_binding[rule_name]
-                if kind == KIND_DETECTOR:
+                uid, kind, violation = self._rule_binding[rule_name]
+                # presence 型规则挂的是锚点(person)本身，不参与「整帧检测器空间关联」
+                # 收集；否则 person uid 会进这个集合却被下面第一趟 continue 跳过，
+                # 白建一个永远为空的桶。
+                if kind == KIND_DETECTOR and violation is not None:
                     active_detector_uids.add(uid)
 
             # 第一趟: OSD policy —— 非 person 一律无条件隐藏（与 active_rules 解耦）。
@@ -146,21 +190,55 @@ class SafetyProbe(BatchMetadataOperator):
                     obj.text_params.display_text = _HIDE_TEXT
                     continue
 
+                # 代表点只算一次（feet/center 各一个浮点对），供所有区域规则复用
+                bbox = (
+                    int(obj.rect_params.left),
+                    int(obj.rect_params.top),
+                    int(obj.rect_params.left + obj.rect_params.width),
+                    int(obj.rect_params.top + obj.rect_params.height),
+                )
+                feet = anchor_point(*bbox, "feet")
+                center = anchor_point(*bbox, "center")
+
                 attrs: list[AttributeMeta] = []
                 for rule_name in active:
                     rule = self._rules[rule_name]
                     uid, kind, violation = self._rule_binding[rule_name]
+
+                    # ① presence 型（区域入侵）: 区域内出现人员即命中，不看任何违规属性
+                    if rule_name in self._presence_rules:
+                        zone = self._matchers[rule_name].hit(feet, center)
+                        if zone is not None:
+                            attrs.append(AttributeMeta(rule_name, obj.confidence,
+                                                       zone=zone.id))
+                        continue
+
+                    # ② violation 型: 先判违规（现有逻辑），再过区域门
                     if kind == KIND_DETECTOR:
                         conf = self._match_violation(
                             obj, detector_boxes.get(uid, []),
                             violation, rule.attribute_threshold,
                         )
-                        if conf is not None:
-                            attrs.append(AttributeMeta(rule_name, conf))
                     else:  # classifier
                         label = self._classifier_label(obj.classifier_items, uid)
-                        if label == violation:
-                            attrs.append(AttributeMeta(rule_name, CLASSIFIER_FALLBACK_CONF))
+                        conf = CLASSIFIER_FALLBACK_CONF if label == violation else None
+
+                    if conf is None:
+                        continue
+
+                    matcher = self._matchers.get(rule_name)
+                    if matcher is not None:
+                        zone = matcher.hit(feet, center)
+                        if zone is None:
+                            # 违规成立但人在区域外 → 不告警。现场标定期极易被误读成
+                            # 「模型没跑」，故留一条可按路开关的 DEBUG（默认关）。
+                            if self._log_out_of_zone:
+                                logger.debug("out_of_zone camera={} rule={} conf={:.2f}",
+                                             self._camera_name(source_id), rule_name, conf)
+                            continue
+                        attrs.append(AttributeMeta(rule_name, conf, zone=zone.id))
+                    else:
+                        attrs.append(AttributeMeta(rule_name, conf))
 
                 # 有违规=红框+标签；无违规=隐藏（classifier 合规类不可观测）
                 if attrs:
@@ -176,12 +254,7 @@ class SafetyProbe(BatchMetadataOperator):
                 objects.append(ObjectMeta(
                     class_name="person",
                     confidence=obj.confidence,
-                    bbox=(
-                        int(obj.rect_params.left),
-                        int(obj.rect_params.top),
-                        int(obj.rect_params.left + obj.rect_params.width),
-                        int(obj.rect_params.top + obj.rect_params.height),
-                    ),
+                    bbox=bbox,
                     attributes=tuple(attrs),
                 ))
 
@@ -208,6 +281,11 @@ class SafetyProbe(BatchMetadataOperator):
     # ------------------------------------------------------------------
     # 静态工具
     # ------------------------------------------------------------------
+    def _camera_name(self, source_id: int) -> str:
+        """日志用路名（AlertManager 未注册时回退 source_id，不影响判定）。"""
+        manager = self._managers.get(source_id)
+        return getattr(manager, "camera_name", None) or f"source{source_id}"
+
     @staticmethod
     def _match_violation(obj, boxes, violation_label, conf_threshold):
         """中心点落在 person 框内、label==violation、置信度达标的框 → 最高置信度（无则 None）。"""

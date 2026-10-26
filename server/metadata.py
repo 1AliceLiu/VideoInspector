@@ -19,10 +19,12 @@ class AttributeMeta:
 
     bbox=None 时为纯分类属性（如 "is_smoking"、"helmet" / "no_helmet" 状态）；
     bbox 非 None 时为带空间定位的细粒度检测（全帧坐标）。
+    zone 非 None 时为命中该属性所用的区域 id（回指标定侧 RuleId，供下游关联）。
     """
     name: str
     confidence: float
     bbox: tuple[int, int, int, int] | None = None
+    zone: str | None = None
 
 
 @dataclass(frozen=True)

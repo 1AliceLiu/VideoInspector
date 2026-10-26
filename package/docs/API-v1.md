@@ -102,7 +102,9 @@
       "params_schema": {
         "cooldown_seconds": {"type": "number", "min": 0, "default": 10},
         "min_detection_count": {"type": "integer", "min": 1, "default": 3},
-        "attribute_threshold": {"type": "number", "min": 0, "max": 1, "default": 0.5}
+        "attribute_threshold": {"type": "number", "min": 0, "max": 1, "default": 0.5},
+        "zones": {"type": "array", "required": false,
+                  "note": "省略=全图判定；给出=仅区域内命中才告警"}
       }
     },
     {
@@ -114,6 +116,23 @@
         "cooldown_seconds": {"type": "number", "min": 0, "default": 300},
         "min_detection_count": {"type": "integer", "min": 1, "default": 15},
         "profile": {"type": "string", "enum": ["loose", "normal", "strict"], "default": "normal", "supported": false}
+      }
+    },
+    {
+      "id": "intrusion",
+      "display_name": "intrusion",
+      "kind": "detector",
+      "model_version": "person",
+      "params_schema": {
+        "cooldown_seconds": {"type": "number", "min": 0, "default": 0},
+        "min_detection_count": {"type": "integer", "min": 1, "default": 5},
+        "zones": {"type": "array", "required": true,
+                  "items": {"id": "string",
+                            "anchor": {"enum": ["feet", "center"], "default": "feet"},
+                            "points": "array of [x, y], 归一化 0~1, >=3 顶点"},
+                  "note": "省略则本算法在全图判定；给出则仅区域内命中才告警"},
+        "vacant_frames": {"type": "integer", "min": 1, "default": 50,
+                          "note": "离开去抖：区域内连续 N 帧无人才算本次事件结束（按该路处理帧率换算）"}
       }
     }
   ]
@@ -128,6 +147,29 @@
 | `min_detection_count` | 全部 | 连续多少帧命中才触发，越大越稳、越迟钝 |
 | `attribute_threshold` | detector 类（如 `no_helmet`、`smoking`） | 违规置信度门限，0~1 |
 | `profile` | classifier 类（如 `no_vest`、`no_harness`） | 严格程度档位：`loose` / `normal` / `strict`；**v0.1 暂未开放按摄像头配置** |
+| `zones` | 全部 | 空间作用域：归一化多边形列表。**省略 = 全图判定**；给出 = 仅区域内命中才告警。`intrusion` 必须给出 |
+| `vacant_frames` | 仅 `intrusion` | 离开去抖帧数：区域内连续 N 帧无人才算本次事件结束，等待下一次进入 |
+
+**区域（zones）语义**：
+
+- 坐标为**归一化 0~1**（相对画面宽高），可直接用平台标定文件里的 `Points[].X/Y`，
+  无需换算；分辨率变化也不需要重标。
+- 每个区域 `points` 至少 3 个顶点，**顶点数不限**（自由多边形），但不超过 32；
+  顶点顺序须构成不自交的简单多边形，否则返回 `422 INVALID_PARAM`。
+- `anchor` 决定「人的哪个点算数」：`feet`（默认，检测框底边中点，即人踩进区域）
+  或 `center`（框中心）。
+- `id` 建议沿用平台 `RuleId`（如 `r9-1`），命中后会原样出现在告警 payload 的
+  `zones` 里，便于与标定侧对齐。
+- 同一算法可配多个区域，命中任一即算区域内。
+
+**`intrusion`（区域入侵）的告警节奏** —— 与 PPE 类算法不同，请按「事件」而非「电平」理解：
+
+- 系统每帧只判断一件事：「区域内有没有人」。
+- **只在「空 → 有人」的跳变时报 1 条**；人持续在场（哪怕 30 分钟）不再重复报。
+- 区域内连续 `vacant_frames` 帧无人 → 本次事件结束；之后再次有人进入 → 新的 1 条。
+- 区域内同时多人 → 仍算 1 条（本版本不做人员识别/跟踪）。
+- `cooldown_seconds` 对 `intrusion` 不是冷却而是「并入窗口」，建议 `0`；
+  设 >0 会把窗口内的新一次进入并入上一条，不单独成单。
 
 **classifier 阈值说明**：分类器的阈值目前写死在模型配置里，v0.1 不支持按摄像头传任意数值，也不支持按摄像头选 `profile`；当前只支持 `cooldown_seconds` 和 `min_detection_count` 按摄像头调。`profile` 字段先保留在契约里，下一版再实现。实现时需要增加全局分类器实例，档位越多 GPU 开销越高，建议最多 3 档。
 
@@ -473,6 +515,7 @@ Payload：
   "device_code": "ICC-DEVICE-001",
   "channel_no": "1",
   "timestamp": "2026-10-23T02:15:33.12+00:00",
+  "zones": [],
   "objects": [
     {
       "class": "person",
@@ -482,7 +525,8 @@ Payload：
         {
           "class": "no_vest",
           "confidence": 0.5,
-          "bbox": null
+          "bbox": null,
+          "zone": null
         }
       ]
     }
@@ -497,6 +541,10 @@ Payload：
 - 至少一次投递，可能重复；平台侧需要幂等。
 - `frame_base64` 默认携带；当前支持全局关闭（`webhook.include_frame: false`），按摄像头关闭下一版支持。
 - `device_code`/`channel_no` 没配置时为 `null`。
+- `zones` 为本条告警命中的区域 id 列表（沿用标定的 `RuleId`）；**未配置区域的算法恒为 `[]`**，
+  表示全图判定。`objects[].attributes[].zone` 为该条属性命中的具体区域，未配区域时为 `null`。
+- `alert_type: "intrusion"` 表示一次区域入侵事件：同一事件只推 1 条（人持续在场不重复推），
+  区域内多人也只 1 条；请按 `event_id` 建单，勿按条数累计人数。
 
 ## 14. v1 不包含
 

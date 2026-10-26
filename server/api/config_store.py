@@ -21,13 +21,15 @@ from pathlib import Path
 import yaml
 
 from server.config import validate_config
+from server.alert.regions import parse_zones
 from server.model_spec import KIND_DETECTOR, parse_gies
 from server.api.errors import ApiError
 from server.api.util import atomic_write_json, atomic_write_text, mask_rtsp_url, now_iso
 
 GENERATED_PREFIX = "__cam__"
 CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-ALLOWED_PARAMS = ("cooldown_seconds", "min_detection_count", "attribute_threshold")
+ALLOWED_PARAMS = ("cooldown_seconds", "min_detection_count", "attribute_threshold",
+                  "zones", "vacant_frames")
 MAX_HISTORY = 20
 MAX_CAMERAS = 32  # 与 tools/model_build.py 的引擎 max_batch 一致
 
@@ -168,18 +170,37 @@ class ConfigStore:
                     "default": rule.get("min_detection_count", 1),
                 },
             }
-            if gie.kind == KIND_DETECTOR:
+            gie_kind = gie.kind if gie is not None else None
+            presence = (rule or {}).get("trigger") == "presence"
+            if gie_kind == KIND_DETECTOR and not presence:
                 schema["attribute_threshold"] = {
                     "type": "number", "min": 0, "max": 1,
                     "default": rule.get("attribute_threshold", 0.5),
                 }
-            else:
+            elif gie_kind == KIND_CLASSIFIER:
                 schema["profile"] = {
                     "type": "string",
                     "enum": ["loose", "normal", "strict"],
                     "default": "normal",
                     "supported": False,
                     "note": "v0.1 仅支持全局配置；按摄像头阈值需要下一版",
+                }
+            # 区域能力：省略 zones = 全图生效；presence 型（区域入侵）必须给出
+            schema["zones"] = {
+                "type": "array",
+                "items": {
+                    "id": "string",
+                    "anchor": {"enum": ["feet", "center"], "default": "feet"},
+                    "points": "array of [x, y], 归一化 0~1, >=3 顶点",
+                },
+                "required": (rule or {}).get("trigger") == "presence",
+                "note": "省略则本算法在全图判定；给出则仅区域内命中才告警",
+            }
+            if (rule or {}).get("trigger") == "presence":
+                schema["vacant_frames"] = {
+                    "type": "integer", "min": 1,
+                    "default": rule.get("vacant_frames", 1),
+                    "note": "离开去抖：区域内连续 N 帧无人才算本次事件结束（按该路处理帧率换算）",
                 }
             items.append({
                 "id": name,
@@ -404,7 +425,8 @@ class ConfigStore:
             if not isinstance(params, dict):
                 raise ApiError(400, "INVALID_ARGUMENT", "params 必须是对象")
 
-            self._validate_params(alg_id, gie.kind, params)
+            self._validate_params(alg_id, gie.kind, params,
+                                  trigger=(base.get("trigger") or "violation"))
             if not params:
                 active.append(alg_id)
                 continue
@@ -423,16 +445,35 @@ class ConfigStore:
         cam["active_rules"] = active
 
     @staticmethod
-    def _validate_params(alg_id: str, kind: str, params: dict) -> None:
+    def _validate_params(alg_id: str, kind: str, params: dict,
+                         trigger: str = "violation") -> None:
         unknown = set(params) - set(ALLOWED_PARAMS) - {"profile"}
         if unknown:
             raise ApiError(422, "INVALID_PARAM", f"算法 {alg_id} 不支持参数: {sorted(unknown)}")
+        # presence 型（区域入侵）只看「区域内有没有人」，不做任何模型置信度判定；
+        # 它的 attribute_threshold 只是校验器要求的占位值，不对外开放，避免平台误调。
+        if trigger == "presence" and "attribute_threshold" in params:
+            raise ApiError(
+                422, "UNSUPPORTED_PARAM",
+                f"算法 {alg_id} 是区域存在性判定（presence），不支持 attribute_threshold",
+            )
         if "profile" in params:
             raise ApiError(
                 422, "UNSUPPORTED_PARAM",
                 f"算法 {alg_id} 的 profile 参数暂未在 v0.1 开放；"
                 "请用 cooldown_seconds/min_detection_count，或等下一版",
             )
+        # 区域：结构与取值复用运行期同一套解析（server/alert/regions.parse_zones），
+        # 避免「API 收得下、启动时炸」的双标；坏区域在写入前就 422 回去。
+        if "zones" in params:
+            try:
+                parse_zones(params["zones"], where=f"api.{alg_id}")
+            except ValueError as exc:
+                raise ApiError(422, "INVALID_PARAM", str(exc)) from exc
+        if "vacant_frames" in params:
+            value = params["vacant_frames"]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ApiError(422, "INVALID_PARAM", "vacant_frames 必须是 >=1 的整数")
         if "cooldown_seconds" in params:
             value = params["cooldown_seconds"]
             if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
@@ -481,8 +522,16 @@ class ConfigStore:
                 params["cooldown_seconds"] = rule["cooldown_seconds"]
             if "min_detection_count" in rule:
                 params["min_detection_count"] = rule["min_detection_count"]
-            if gie is not None and gie.kind == KIND_DETECTOR and "attribute_threshold" in rule:
+            if (gie is not None and gie.kind == KIND_DETECTOR
+                    and rule.get("trigger") != "presence"
+                    and "attribute_threshold" in rule):
                 params["attribute_threshold"] = rule["attribute_threshold"]
+            # 区域参数必须回显：视图是「读→改→写」闭环的唯一事实来源，
+            # 漏掉会导致下一次按算法写入把已有 zones 静默清空。
+            if "zones" in rule:
+                params["zones"] = copy.deepcopy(rule["zones"])
+            if "vacant_frames" in rule:
+                params["vacant_frames"] = rule["vacant_frames"]
             algorithms.append({"id": alg_id, "params": params})
             if gie is not None:
                 versions[alg_id] = gie.version

@@ -4,8 +4,8 @@
 import yaml
 from pathlib import Path
 
-from server.alert.rules import parse_rules
-from server.model_spec import parse_gies
+from server.alert.rules import parse_rules, TRIGGER_PRESENCE
+from server.model_spec import parse_gies, KIND_DETECTOR
 
 
 def load_config(config_path: str) -> dict:
@@ -41,6 +41,7 @@ def validate_config(config: dict, path: Path):
         errors.append(f"model.person_conf_threshold 必须是 0~1 的置信度阈值，当前: {person_conf!r}")
 
     rules_raw = config.get("rules")
+    rules: dict = {}
     rule_names: set[str] = set()
     if not rules_raw:
         errors.append("缺少 'rules' 节（至少定义一个告警规则）")
@@ -49,8 +50,18 @@ def validate_config(config: dict, path: Path):
             rules = parse_rules(rules_raw)
             rule_names = set(rules)
             for rule in rules.values():
-                if rule.gie not in gies:
+                spec = gies.get(rule.gie)
+                if spec is None:
                     errors.append(f"rules.{rule.name}.gie 引用了未定义的模型: {rule.gie}")
+                    continue
+                # presence 型（区域入侵）不检违规类，只认锚点检出 → 必须挂在无
+                # violation 的锚点检测器上；挂在报警模型上会让「违规」与「在场」混淆
+                if rule.trigger == TRIGGER_PRESENCE:
+                    if spec.kind != KIND_DETECTOR or spec.violation is not None:
+                        errors.append(
+                            f"rules.{rule.name}.gie={rule.gie} 必须是锚点检测器"
+                            "（kind=detector 且无 violation）才能用作 presence 判定"
+                        )
         except ValueError as exc:
             errors.append(str(exc))
 
@@ -58,6 +69,7 @@ def validate_config(config: dict, path: Path):
     if not cameras:
         errors.append("cameras 必须是非空列表（至少一个 enabled=true）")
     else:
+        generated_prefix = "__cam__"      # 与 api.config_store.GENERATED_PREFIX 一致
         for cam in cameras:
             if cam.get("type", "rtsp") != "rtsp":
                 errors.append(f"DeepStream 仅支持 RTSP 摄像头: {cam.get('id')} (type={cam.get('type')})")
@@ -71,6 +83,21 @@ def validate_config(config: dict, path: Path):
                     for rule in active:
                         if rule not in rule_names:
                             errors.append(f"cameras[{cam.get('id')}].active_rules 引用了未定义的规则: {rule}")
+            else:
+                # 未声明 = 该路激活所有非生成态规则（与 builder._active_rules_by_source 一致）
+                active = [n for n in rule_names if not n.startswith(generated_prefix)]
+
+            # presence 型规则的实际生效版本必须带区域：基础规则可作无 zones 的模板
+            # （区域由按摄像头生成的 __cam__ 规则补上），但「某一路跑 presence 且无区域」
+            # 等于「画面里出现任何人都是入侵」，必然刷屏 → 在启动期拒绝。
+            for name in active:
+                rule = rules.get(name)
+                if rule is not None and rule.trigger == TRIGGER_PRESENCE and not rule.zones:
+                    errors.append(
+                        f"cameras[{cam.get('id')}] 生效的规则 {name} 是 presence 型（区域入侵）"
+                        f"但未绑定 zones —— 任何位置出现人员都会判为入侵；"
+                        "请为该摄像头配置区域，或从 active_rules 中移除该规则"
+                    )
 
     webhook = config.get("webhook") or {}
     timeout = webhook.get("timeout")

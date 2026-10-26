@@ -1,0 +1,130 @@
+# =============================================================================
+# 【测试机影子实例】2628 区域入侵 + 安全帽验证专用
+# =============================================================================
+# 目的：在**独立测试机/GPU**上单独跑 2628 一路，验证区域几何、presence 占用
+# 状态机与告警节奏；生产 17 路完全不受影响。
+#
+#   启动:   python -m server.main --config deploy/config.2628-test.yaml
+#   接收端: python local/webhook_receiver.py --port 9999 --save-dir ./alerts
+#
+# 与生产 config.yaml 的关系：
+#   - 共享同一份 models/ 与 generated/（模型产物按版本键命中 → **不触发引擎重建**）
+#   - cameras 只留 2628 一路（batch-size=1，与生产实例的管线互不相干）
+#   - webhook 指向本地浸泡接收端，绝不打到真实下游
+#   - 部署根 = 本文件所在目录（deploy/），相对路径与生产同一解析规则
+# =============================================================================
+
+model:
+  person_conf_threshold: 0.6
+  gies:
+    person:
+      kind: detector
+      source: models/person/yolo26n.pt
+      uid: 1
+
+    helmet:
+      kind: detector
+      source: models/helmet/yolo26s_helm_20260804_0844/weights/best.pt
+      uid: 3
+      violation: head
+
+    vest_cls:
+      kind: classifier
+      source: models/vest/yolo26mcls_ppeVest_20260904_0959/weights/best.pt
+      uid: 6
+      violation: no_vest
+
+    smoke:
+      kind: detector
+      attach: person
+      source: models/smoke/yolo26m_smoking_20260707_0224/weights/best.pt
+      uid: 7
+      violation: cigarette
+
+# -----------------------------------------------------------------------------
+# 规则
+#   intrusion = presence 型（区域内出现人员即事件），绑定 2628-area.txt 区域
+#   no_helmet      = violation 型，**不配 zones → 全图判定**（即 2628 的需求）
+#   no_vest_zone   = violation 型 + 同一区域，用于顺带验证「区域过滤」：
+#                    区域外的未穿反光衣不告警，区域内才告警
+#   影子实例手写生成态规则以便直接起测；生产路径应由 tools/area_import.py 经
+#   ConfigStore 写入（自带备份 / 回滚 / 校验），不要在两边重复维护。
+# -----------------------------------------------------------------------------
+rules:
+  intrusion:
+    gie: person                   # 锚点检测器：不引入任何新模型
+    trigger: presence
+    cooldown_seconds: 0           # presence 建议 0：最小间隔由两个去抖自然提供
+    min_detection_count: 5        # 进入去抖（连续 5 个处理帧在区域内）
+    vacant_frames: 50             # 离开去抖（连续 50 帧无人 ≈10fps 下 5s）
+    attribute_threshold: 0.5      # presence 不使用；校验器要求必填，占位
+    alert_type: intrusion         # 对外类型不带摄像头号
+    zones:
+      - id: r9-1                  # 回指 2628-area.txt 的 RuleId
+        anchor: feet              # 底边中点：人「踩进」区域
+        points:
+          - [0.2943, 0.3311]
+          - [0.4398, 0.3408]
+          - [0.5252, 0.6883]
+          - [0.5066, 0.9835]
+          - [0.0055, 0.9874]
+          - [0.0044, 0.6981]
+
+  no_helmet:
+    gie: helmet
+    cooldown_seconds: 10
+    min_detection_count: 3
+    attribute_threshold: 0.5
+    # 无 zones → 全图（2628 明确要求安全帽不受区域限制）
+
+  no_vest_zone:
+    gie: vest_cls
+    cooldown_seconds: 60
+    min_detection_count: 10
+    attribute_threshold: 0.8
+    alert_type: no_vest           # 对外仍是基础算法名，不泄漏内部规则名
+    zones:
+      - id: r9-1
+        anchor: feet
+        points:
+          - [0.2943, 0.3311]
+          - [0.4398, 0.3408]
+          - [0.5252, 0.6883]
+          - [0.5066, 0.9835]
+          - [0.0055, 0.9874]
+          - [0.0044, 0.6981]
+
+  smoking:
+    gie: smoke
+    cooldown_seconds: 30
+    min_detection_count: 3
+    attribute_threshold: 0.75
+
+# -----------------------------------------------------------------------------
+# Webhook：只发给本栈的接收端容器（绝不接生产真实下游）
+#   容器内 127.0.0.1 = 本容器自身，必须用 compose 服务名解析到 alert-receiver。
+#   ⚠ 若改成「宿主机直接跑进程」调试，把下面换成 http://127.0.0.1:9999/... 并在
+#     宿机起 local/webhook_receiver.py --port 9999
+# -----------------------------------------------------------------------------
+webhook:
+  url: "http://alert-receiver-2628:9999/protal/ai-alarm/webhook"
+  timeout: 10
+  retries: 2
+
+cameras:
+  - id: "2628"
+    name: "AI Camera2628"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003113"
+    enabled: true
+    # 需求终态：区域入侵（带区域）+ 安全帽（全图）
+    # 想顺带验证区域过滤，把 no_vest_zone 加进这个列表
+    active_rules: ["no_helmet", "intrusion"]
+
+source:
+  rtsp_protocol: 4
+  drop_frame_interval: 1
+
+log:
+  level: "DEBUG"                  # 影子实例开 DEBUG，便于看 detect / out_of_zone 明细
+  file: "logs/server-2628-test.log"
+  out_of_zone: true               # 区域标定期：记录「违规成立但在区域外被淘汰」

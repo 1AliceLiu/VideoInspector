@@ -16,11 +16,13 @@ from datetime import datetime, timezone
 from enum import Enum
 
 import cv2
+import numpy as np
 import simplejpeg
 from loguru import logger
 
 from server.metadata import ObjectMeta
-from server.alert.rules import RuleConfig
+from server.alert.regions import Zone
+from server.alert.rules import RuleConfig, TRIGGER_PRESENCE
 from server.alert.webhook import WebhookAlerter
 
 
@@ -32,7 +34,7 @@ class AlertState(Enum):
 
 
 class _RuleState:
-    """单条规则独立的状态机（冷却 / 连续帧确认）。
+    """单条 violation 型规则的独立状态机（冷却 / 连续帧确认）。
 
     与摄像头解耦：同摄像头多条规则各自演进，互不竞争。
     """
@@ -79,6 +81,72 @@ class _RuleState:
         return None
 
 
+class _PresenceState:
+    """presence 型规则（区域入侵）的占用状态机 —— 报「事件」，不报「电平」。
+
+    只回答一个问题：「区域内现在有没有人？」
+
+        空 ──(连续 min_detection_count 帧有人)──▶ 占用  ← 此刻发一条告警
+        占用 ──(连续 vacant_frames 帧无人)────▶ 空      ← 事件结束，复位待下一次进入
+
+    与 _RuleState 的关键差别（这是区域入侵必须换语义的原因）:
+      - _RuleState 在冷却期内**完全不看画面**（直接 return None），所以一波入侵的
+        安静期内发生的**下一次**入侵会被吞掉（漏报）；而人一直待在场内时又会每个
+        安静周期重复报一次（刷屏）。调大调小都只会在两个毛病之间来回。
+      - 本状态机每帧都看画面，只是「状态跳变才报」：一次入侵 = 一条告警；
+        人在里面待 30 分钟 = 仍然一条；人走光后再进 = 新的一条。
+      - 不需要 tracker：判定量是「区域有没有人」这个布尔值，不涉及人员身份。
+
+    cooldown_seconds 在此**退化为「并入窗口」**（presence 规则建议配 0）：
+      - 0 = 关闭。两次告警的最小间隔由两个去抖自然提供（进入 min_detection_count
+        帧 + 离开 vacant_frames 帧），不会漏掉任何一次独立入侵。
+      - >0 = 地板内的新事件**并入**上一条不单独成单：人员持续在场时会在地板解除的
+        那一帧补报；若人在地板解除前就离开了，则该次不再成单（视为上一次事件的余波）。
+      所以这个值是用来「合并同一波次进出」的，不是限速器；拿它当限速器会吞掉
+      独立的第二次入侵（见 tests 场景 B）。
+    """
+
+    def __init__(self, rule: RuleConfig):
+        self.rule = rule
+        self._occupied = False        # 是否已就「本次占用事件」报过警
+        self._hits = 0                # 进入去抖计数
+        self._vacant = 0              # 离开去抖计数
+        self._floor_until = 0.0       # monotonic：防洪地板结束时刻
+
+    def handle(self, alert_objects: list[ObjectMeta]) -> list[ObjectMeta] | None:
+        """处理一帧「区域内是否有人」的采样。
+
+        Args:
+            alert_objects: 本帧落在本规则区域内的 ObjectMeta 列表（空=区域内无人）。
+
+        Returns:
+            仅在「空 → 占用」的上升沿返回触发对象列表，其余一律 None。
+        """
+        now = time.monotonic()
+
+        if alert_objects:
+            self._vacant = 0
+            if self._occupied:
+                return None                       # 事件进行中：不再重复报
+            self._hits += 1
+            if self._hits < self.rule.min_detection_count:
+                return None                       # 进入去抖未达标
+            if now < self._floor_until:
+                return None                       # 并入窗口内：本次不单独成单
+            self._occupied = True
+            self._hits = 0
+            self._floor_until = now + self.rule.cooldown_seconds
+            return alert_objects
+
+        self._hits = 0
+        if self._occupied:
+            self._vacant += 1
+            if self._vacant >= self.rule.vacant_frames:
+                self._occupied = False            # 连续够久无人 → 事件结束
+                self._vacant = 0
+        return None
+
+
 class AlertManager:
     """管理单路摄像头的告警状态与分发（内部按规则拆分独立状态机）。
 
@@ -116,9 +184,13 @@ class AlertManager:
         self.last_alert_at: str | None = None
         self.last_alert_type: str | None = None
 
-        # 每条规则一个独立状态机（rule_name → _RuleState）
-        self._rule_states: dict[str, _RuleState] = {
-            rule.name: _RuleState(rule) for rule in rules
+        # 每条规则一个独立状态机（rule_name → 状态机实例）：
+        #   violation 型（PPE 类）→ _RuleState（连续帧确认 + 冷却）
+        #   presence  型（区域入侵）→ _PresenceState（占用上升沿，报事件不报电平）
+        self._rule_states: dict[str, _RuleState | _PresenceState] = {
+            rule.name: (_PresenceState(rule) if rule.trigger == TRIGGER_PRESENCE
+                        else _RuleState(rule))
+            for rule in rules
         }
 
     # ------------------------------------------------------------------
@@ -243,7 +315,9 @@ class AlertManager:
                 # snapshot 是延迟句柄（EvidenceFrame）或 BGR ndarray；前者只在
                 # 真正编码告警时触发 GPU→CPU，告警稀疏 → 常态零拷贝。
                 frame_src = snapshot.bgr() if hasattr(snapshot, "bgr") else snapshot
-                frame = self._render_evidence(frame_src, alert_type, alert_objects)
+                state = self._rule_states.get(rule_name)
+                zones = state.rule.zones if state is not None else ()
+                frame = self._render_evidence(frame_src, alert_type, alert_objects, zones)
                 buffer = simplejpeg.encode_jpeg(frame, quality=85, colorspace='BGR')
 
             # 3. Fire-and-forget: base64 → JSON → HTTP 全部在独立 daemon 线程
@@ -258,16 +332,33 @@ class AlertManager:
             logger.exception("Webhook 构建异常")
 
     @staticmethod
-    def _render_evidence(snapshot, alert_type: str,
-                         alert_objects: list[ObjectMeta]):
-        """在原始证据帧上用 cv2 补画违规 person 红框 + 规则名标签。
+    def _render_evidence(snapshot, alert_type: str, alert_objects: list[ObjectMeta],
+                         zones: tuple[Zone, ...] = ()):
+        """在原始证据帧上用 cv2 补画违规 person 红框 + 规则名标签（+ 区域轮廓）。
 
         返回**新数组**（不原地修改 FrameCache 持有的帧）。坐标为管线系 (x1,y1,x2,y2)，
         与 snapshot 同分辨率，直接对齐；越界自动裁剪。
+
+        zones 非空时叠加区域轮廓（黄色闭合折线 + 区域 id）：入参是归一化坐标，按
+        **本帧实际宽高**缩放，因此与 nvstreammux / 预览分辨率无关，换分辨率不用改配置。
+        这一层是区域类告警的自证依据——图上能直接看出「人是否踩在区域内」。
         """
         frame = snapshot.copy()
         h, w = frame.shape[:2]
         color = (0, 0, 255)  # BGR 红
+
+        # 先画区域（在框之下，避免遮挡违规框与标签）
+        for zone in zones or ():
+            # 映射与探针的 ZoneMatcher 一致：归一化 × 帧宽/高（不是 w-1），
+            # 这样「图上看着在界内/界外」与「判定实际用的界」不会差出半个像素。
+            pts = np.array([[int(min(max(0.0, x * w), w - 1)),
+                             int(min(max(0.0, y * h), h - 1))]
+                            for x, y in zone.points], dtype=np.int32)
+            cv2.polylines(frame, [pts], True, (0, 255, 255), 2, cv2.LINE_AA)
+            tx, ty = int(pts[0][0]), max(14, int(pts[0][1]) - 6)
+            cv2.putText(frame, zone.id, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
         for obj in alert_objects:
             x1, y1, x2, y2 = obj.bbox
             x1 = max(0, min(int(x1), w - 1))
@@ -309,10 +400,16 @@ class AlertManager:
                             "class": alert_type,
                             "confidence": round(attr.confidence, 3),
                             "bbox": list(attr.bbox) if attr.bbox is not None else None,
+                            # 命中的区域 id（回指标定侧 RuleId）；全图规则为 null
+                            "zone": attr.zone,
                         }
                         for attr in attrs
                     ]
                 objects_payload.append(entry)
+
+            # 本条告警命中的区域（配了区域的规则才有；供下游与标定侧闭环对齐）
+            hit_zones = sorted({a.zone for obj in alert_objects for a in obj.attributes
+                                if a.name == rule_name and a.zone})
 
             payload = {
                 "event_id": f"evt_{uuid.uuid4().hex}",
@@ -323,6 +420,7 @@ class AlertManager:
                 "device_code": self.device_code,
                 "channel_no": self.channel_no,
                 "timestamp": iso_timestamp,
+                "zones": hit_zones,
                 "objects": objects_payload,
                 "frame_base64": frame_base64,
             }

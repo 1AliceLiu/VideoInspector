@@ -8,13 +8,19 @@ from pathlib import Path
 from pyservicemaker import Pipeline, Probe
 
 from server.alert.manager import AlertManager
-from server.alert.rules import parse_rules
+from server.alert.rules import parse_rules, TRIGGER_PRESENCE
 from server.alert.webhook import WebhookAlerter
 from server.config import DEFAULT_RECONNECT
 from server.model_spec import KIND_CLASSIFIER, KIND_DETECTOR, anchor_uid, parse_gies
 from server.pipeline.frame_cache import FrameCache, add_evidence_capture
 from server.pipeline.ini_patch import anchor_ini_config
 from server.pipeline.probe import SafetyProbe
+
+# 管线画面尺寸（nvstreammux batch 尺寸）—— **单一事实来源**：既用于建 mux，也用于
+# 把区域的归一化坐标换算成像素（探针内命中判定与检测框同一坐标系）。mux 未启用
+# enable-padding（拉伸填满），故归一化坐标 → 像素只需各轴乘本尺寸，见 alert/regions。
+MUX_WIDTH = 1920
+MUX_HEIGHT = 1080
 
 
 def _clean_stale_shm_sockets(socket_path: str, logger) -> None:
@@ -66,8 +72,14 @@ class PipelineBuilder:
         self.rules = parse_rules(config.get("rules"))
         self.person_uid = anchor_uid(self.gies)
         self.person_conf_threshold = float(model.get("person_conf_threshold", 0.6))
-        # 每个 classifier gie 的 classifier-threshold 由引用它的规则 attribute_threshold 重写
-        self.gie_thresholds = {rule.gie: rule.attribute_threshold for rule in self.rules.values()}
+        # 每个 classifier gie 的 classifier-threshold 由引用它的规则 attribute_threshold 重写。
+        # presence 型规则（区域入侵）不做任何模型判定，其 attribute_threshold 只是
+        # 占位值，排除在外以免把无关阈值挂到锚点 person 上。
+        self.gie_thresholds = {
+            rule.gie: rule.attribute_threshold
+            for rule in self.rules.values()
+            if rule.trigger != TRIGGER_PRESENCE
+        }
         self.cameras = [c for c in config.get("cameras") or [] if c.get("enabled", True)]
 
     # ------------------------------------------------------------------ 构建
@@ -88,6 +100,16 @@ class PipelineBuilder:
 
         executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="webhook")
         self.alert_managers = self._build_alert_managers(cfg, executor, logger)
+
+        # 区域标定期排障日志：仅当「本部署真的配了区域」且显式开了 log.out_of_zone
+        # 才逐帧记录「违规成立但在区域外被淘汰」——现场用来区分「模型没检出」与
+        # 「检出后被区域门挡下」。默认关，未配区域的路径完全零开销。
+        log_cfg = cfg.get("log") or {}
+        has_zones = any(rule.zones for rule in self.rules.values())
+        out_of_zone = bool(log_cfg.get("out_of_zone", False)) and has_zones
+        if out_of_zone:
+            logger.info("log.out_of_zone=true：区域外淘汰的违规将以 DEBUG 记录（仅标定期开）")
+
         p.attach(last_infer, Probe("safety-probe", SafetyProbe(
             self.alert_managers,
             executor=executor,
@@ -97,6 +119,8 @@ class PipelineBuilder:
             person_conf_threshold=self.person_conf_threshold,
             active_rules_by_source=self._active_rules_by_source(),
             health=health,
+            mux_width=MUX_WIDTH, mux_height=MUX_HEIGHT,
+            log_out_of_zone=out_of_zone,
         )))
         p.attach(last_infer, "measure_fps_probe", name="fps-probe")
 
@@ -146,8 +170,8 @@ class PipelineBuilder:
 
         p.add("nvstreammux", "mux", {
             "batch-size": len(self.cameras),
-            "width": 1920,
-            "height": 1080,
+            "width": MUX_WIDTH,
+            "height": MUX_HEIGHT,
             "batched-push-timeout": 33000,
             "live-source": 1,
         })

@@ -22,3 +22,11 @@ package/generated/*
 !package/generated/.gitkeep
 package/logs/*
 !package/logs/.gitkeep
+
+# 控制面运行时：revision.json / reload.request / config-history 配置备份
+# ⚠ 备份内含完整 RTSP URL（带凭据），绝不入库
+deploy/runtime/
+
+# 2628 影子实例私有产物与告警（cp -a deploy/generated deploy/generated-2628 生成）
+deploy/generated-2628/
+deploy/alerts-2628/

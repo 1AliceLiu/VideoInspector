@@ -15,6 +15,8 @@
 #   violation 报警类标签（只写报警类，如 head/no_vest/no_harness/cigarette；锚点无此字段）
 #             classifier 若 violation 不在 index0，构建工具自动交换输出通道使其落到 class0
 # rules 每条独立状态机（冷却 / 连续帧确认 / 违规置信度门限），gie 引用上面的模型名。
+#   另可选 trigger: presence（区域入侵，只看「区域内有没有人」）+ zones（归一化
+#   多边形，省略=全图判定）；详见 rules 节内注释与 server/alert/regions.py。
 # =============================================================================
 
 model:
@@ -82,6 +84,26 @@ rules:
     cooldown_seconds: 30
     min_detection_count: 3
     attribute_threshold: 0.75
+
+  # 区域入侵（presence 型）——**模板规则，当前无摄像头引用**。
+  #   gie: person    锚点检测器（uid=1，已在推理），不引入任何新模型/新引擎
+  #   trigger: presence  区域内出现人员即事件，不看任何违规属性
+  #   zones 故意留空: 区域是「每摄像头×每算法」的属性，由 tools/area_import.py
+  #     经 ConfigStore 生成 __cam__ 实例补上；validate_config 会拒绝「某路激活了
+  #     presence 规则但没有区域」的配置（否则等于全画面任何人都是入侵）。
+  #   vacant_frames: 离开去抖——区域内连续 N 帧无人才算本次事件结束。
+  #     ⚠ 必须大于最差检测闪烁间隔（实测参考: 0.5s 闪烁需 >=20 帧，5 帧压不住）。
+  #   cooldown_seconds: presence 下不是冷却而是「并入窗口」，建议 0；
+  #     事件间最小间隔已由 min_detection_count + vacant_frames 提供。
+  #     一次入侵=一条告警：人持续在场 30 分钟也只报 1 条。
+  intrusion:
+    gie: person
+    trigger: presence
+    cooldown_seconds: 0
+    min_detection_count: 5
+    vacant_frames: 50
+    attribute_threshold: 0.5      # presence 不使用；校验器要求必填，占位
+    alert_type: intrusion
 
 # -----------------------------------------------------------------------------
 # Webhook 告警推送（alert_type 为触发的规则名，如 "no_vest"）
@@ -310,3 +332,7 @@ source:
 log:
   level: "INFO"
   file: "logs/server.log"
+  # out_of_zone: 区域标定期排障开关。true 时逐条 DEBUG 记录「违规成立但人在区域外
+  # 而被淘汰」的命中，用于区分「模型没检出」与「检出后被区域门挡下」。
+  # 仅在配置了区域的路上有意义，且逐帧写日志 —— 标定完请关掉恢复 INFO。
+  out_of_zone: false
