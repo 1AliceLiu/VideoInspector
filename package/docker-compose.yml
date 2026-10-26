@@ -1,0 +1,68 @@
+name: video-inspector-api
+
+services:
+  detector:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: video-inspector-detector:0.1
+    pull_policy: build
+    container_name: video-inspector-detector
+    privileged: true
+    ipc: host
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - SAFETY_CONFIG=/app/deploy/config/config.yaml
+      - SAFETY_RUNTIME_DIR=/app/deploy/runtime
+      - SAFETY_WEBHOOK_SECRET=${SAFETY_WEBHOOK_SECRET:-}
+    volumes:
+      - ./config:/app/deploy/config:rw
+      - ./models:/app/deploy/config/models:ro
+      - ./generated:/app/deploy/config/generated
+      - ./logs:/app/deploy/config/logs
+      - ./runtime:/app/deploy/runtime
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    image: video-inspector-api:0.1
+    pull_policy: build
+    container_name: video-inspector-api
+    environment:
+      - SAFETY_CONFIG=/app/deploy/config/config.yaml
+      - SAFETY_RUNTIME_DIR=/app/deploy/runtime
+      - SAFETY_API_KEY=${SAFETY_API_KEY:-}
+      - SAFETY_API_ALLOW_NO_AUTH=${SAFETY_API_ALLOW_NO_AUTH:-0}
+      - SAFETY_ICC_RTSP_TEMPLATE=${SAFETY_ICC_RTSP_TEMPLATE:-}
+      - SAFETY_APPLY_TIMEOUT=${SAFETY_APPLY_TIMEOUT:-90}
+    volumes:
+      - ./config:/app/deploy/config:rw
+      - ./runtime:/app/deploy/runtime
+    ports:
+      - "${SAFETY_API_PORT:-18080}:8080"
+    depends_on:
+      - detector
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped

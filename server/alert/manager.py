@@ -11,6 +11,7 @@
 import base64
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from enum import Enum
 
@@ -92,6 +93,9 @@ class AlertManager:
         camera_name: str,
         rules: list[RuleConfig],
         webhook: WebhookAlerter | None = None,
+        device_code: str | None = None,
+        channel_no: str | None = None,
+        include_frame: bool = True,
     ):
         """
         Args:
@@ -99,10 +103,18 @@ class AlertManager:
             camera_name: 摄像头显示名称
             rules: 本路激活的告警规则（每条独立状态机，alert_type=规则名）
             webhook: Webhook 推送实例，None 则不推送
+            device_code: ICC 设备编码（可选，随 webhook 输出）
+            channel_no: ICC 通道号（可选，随 webhook 输出）
         """
         self.camera_id = camera_id
         self.camera_name = camera_name
+        self.device_code = device_code
+        self.channel_no = channel_no
+        self.include_frame = include_frame
         self.webhook = webhook
+        # 最近一次告警（供控制面状态查询；只在触发时写，热路径无额外开销）
+        self.last_alert_at: str | None = None
+        self.last_alert_type: str | None = None
 
         # 每条规则一个独立状态机（rule_name → _RuleState）
         self._rule_states: dict[str, _RuleState] = {
@@ -132,6 +144,7 @@ class AlertManager:
         """
         triggered = False
         for rule_name, state in self._rule_states.items():
+            alert_type = state.rule.alert_type or rule_name
             # 只挑携带本规则违规属性的对象
             alert_objects = [
                 obj for obj in objects
@@ -143,17 +156,17 @@ class AlertManager:
                     for obj in alert_objects
                 ]
                 logger.debug("detect camera={} rule={} objs={}", self.camera_name,
-                             rule_name, attr_names)
+                             alert_type, attr_names)
             fired = state.handle(alert_objects)
             if fired:
-                self._trigger(rule_name, fired, snapshot, executor, frame_info)
+                self._trigger(rule_name, alert_type, fired, snapshot, executor, frame_info)
                 triggered = True
         return triggered
 
     # ------------------------------------------------------------------
     # 内部方法
     # ------------------------------------------------------------------
-    def _trigger(self, rule_name: str, alert_objects: list[ObjectMeta],
+    def _trigger(self, rule_name: str, alert_type: str, alert_objects: list[ObjectMeta],
                  snapshot, executor=None, frame_info=None):
         """触发告警：轻量调度 → 卸载所有重操作到 executor。
 
@@ -161,7 +174,8 @@ class AlertManager:
         JPEG 编码 / base64 / JSON / HTTP POST 全部在 _build_and_send 中执行。
 
         Args:
-            rule_name: 触发的规则名（随 payload.alert_type 输出）
+            rule_name: 内部规则名（可能是按摄像头生成的 __cam__ 规则）
+            alert_type: 对外报警类型（webhook alert_type，通常是基础算法名）
             alert_objects: 触发告警的 ObjectMeta 列表
             snapshot: 证据帧（nvdsosd 已渲染的 BGR numpy 数组），None 表示暂无证据帧
             executor: 可选 ThreadPoolExecutor
@@ -169,26 +183,28 @@ class AlertManager:
         """
         now = datetime.now(timezone.utc)
         iso_timestamp = now.isoformat()
+        self.last_alert_at = iso_timestamp
+        self.last_alert_type = alert_type
 
         best_obj = max(alert_objects, key=lambda o: o.confidence)
         logger.info("🚨 alert camera={} rule={} class={} conf={:.2f}",
-                    self.camera_name, rule_name, best_obj.class_name,
+                    self.camera_name, alert_type, best_obj.class_name,
                     best_obj.confidence)
 
         # 证据帧同步观测：decision（判定帧）与 snapshot（缓存帧）的帧号/PTS 差，
         # 用于验证「告警已判定但证据帧无框」是否源于帧滞后（Phase 1 只观测不补框）。
         if frame_info is not None:
-            self._log_evidence_sync(rule_name, frame_info)
+            self._log_evidence_sync(alert_type, frame_info)
 
         # JPEG 编码在 executor 线程，base64/JSON/HTTP 由 daemon 线程 fire-and-forget。
         # snapshot 为 None 时仍推送（frame_base64=null），保证无证据帧时不丢告警。
         if self.webhook and executor is not None:
             executor.submit(
                 self._build_and_send,
-                rule_name, snapshot, alert_objects, iso_timestamp,
+                rule_name, alert_type, snapshot, alert_objects, iso_timestamp,
             )
 
-    def _log_evidence_sync(self, rule_name: str, frame_info):
+    def _log_evidence_sync(self, alert_type: str, frame_info):
         """打一条 evidence 同步日志（camera_id / rule / 帧号与 PTS 差）。
 
         仅观测，不改变判定与取证行为；delta 为负或元信息缺失时相应字段为 None。
@@ -202,14 +218,14 @@ class AlertManager:
         logger.info(
             "evidence camera={} rule={} decision_fn={} snapshot_fn={} "
             "delta_fn={} decision_ts={} snapshot_ts={} delta_ms={}",
-            self.camera_id, rule_name, decision_fn, snap_fn,
+            self.camera_id, alert_type, decision_fn, snap_fn,
             delta_fn, decision_ts, snap_ts, delta_ms,
         )
 
     # ------------------------------------------------------------------
     # 后台线程：JPEG 编码（executor）→ fire-and-forget 推送（daemon）
     # ------------------------------------------------------------------
-    def _build_and_send(self, rule_name: str, snapshot,
+    def _build_and_send(self, rule_name: str, alert_type: str, snapshot,
                         alert_objects: list[ObjectMeta], iso_timestamp: str):
         """JPEG 编码在 executor 线程执行（C 扩展，释放 GIL）。
 
@@ -223,26 +239,26 @@ class AlertManager:
             # 2. 补画违规框 + JPEG 编码（C 扩展，释放 GIL）— executor 线程唯一重操作；
             #    snapshot 为 None 时跳过，payload.frame_base64=null
             buffer = None
-            if snapshot is not None:
+            if snapshot is not None and self.include_frame:
                 # snapshot 是延迟句柄（EvidenceFrame）或 BGR ndarray；前者只在
                 # 真正编码告警时触发 GPU→CPU，告警稀疏 → 常态零拷贝。
                 frame_src = snapshot.bgr() if hasattr(snapshot, "bgr") else snapshot
-                frame = self._render_evidence(frame_src, rule_name, alert_objects)
+                frame = self._render_evidence(frame_src, alert_type, alert_objects)
                 buffer = simplejpeg.encode_jpeg(frame, quality=85, colorspace='BGR')
 
             # 3. Fire-and-forget: base64 → JSON → HTTP 全部在独立 daemon 线程
             threading.Thread(
                 target=self._send_payload,
-                args=(rule_name, buffer, alert_objects, iso_timestamp),
+                args=(rule_name, alert_type, buffer, alert_objects, iso_timestamp),
                 daemon=True,
-                name=f"webhook-send-{self.camera_id}-{rule_name}",
+                name=f"webhook-send-{self.camera_id}-{alert_type}",
             ).start()
 
         except Exception:
             logger.exception("Webhook 构建异常")
 
     @staticmethod
-    def _render_evidence(snapshot, rule_name: str,
+    def _render_evidence(snapshot, alert_type: str,
                          alert_objects: list[ObjectMeta]):
         """在原始证据帧上用 cv2 补画违规 person 红框 + 规则名标签。
 
@@ -259,13 +275,13 @@ class AlertManager:
             x2 = max(0, min(int(x2), w - 1))
             y2 = max(0, min(int(y2), h - 1))
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 4)
-            (_, th), _ = cv2.getTextSize(rule_name, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            (_, th), _ = cv2.getTextSize(alert_type, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
             ty = y1 - 8 if y1 - 8 - th >= 0 else min(h - 1, y2 + th + 8)
-            cv2.putText(frame, rule_name, (x1, ty),
+            cv2.putText(frame, alert_type, (x1, ty),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
         return frame
 
-    def _send_payload(self, rule_name: str, buffer: bytes | None,
+    def _send_payload(self, rule_name: str, alert_type: str, buffer: bytes | None,
                       alert_objects: list[ObjectMeta], iso_timestamp: str):
         """Fire-and-forget: base64 → JSON → HTTP POST。独立 daemon 线程。
 
@@ -278,7 +294,7 @@ class AlertManager:
             if buffer is not None:
                 frame_base64 = base64.b64encode(buffer).decode("utf-8")
 
-            # 2. 构建告警 payload（alert_type = 触发的规则名）
+            # 2. 构建告警 payload（alert_type = 对外报警类型，通常是基础算法名）
             objects_payload = []
             for obj in alert_objects:
                 entry = {
@@ -290,7 +306,7 @@ class AlertManager:
                 if attrs:
                     entry["attributes"] = [
                         {
-                            "class": attr.name,
+                            "class": alert_type,
                             "confidence": round(attr.confidence, 3),
                             "bbox": list(attr.bbox) if attr.bbox is not None else None,
                         }
@@ -299,9 +315,13 @@ class AlertManager:
                 objects_payload.append(entry)
 
             payload = {
-                "alert_type": rule_name,
+                "event_id": f"evt_{uuid.uuid4().hex}",
+                "schema_version": "1.0",
+                "alert_type": alert_type,
                 "camera_id": self.camera_id,
                 "camera_name": self.camera_name,
+                "device_code": self.device_code,
+                "channel_no": self.channel_no,
                 "timestamp": iso_timestamp,
                 "objects": objects_payload,
                 "frame_base64": frame_base64,

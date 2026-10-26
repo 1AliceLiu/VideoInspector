@@ -10,3 +10,15 @@ alerts
 logs
 .opencode
 *.tar.gz
+# 交付包产物
+package/dist/
+
+# 交付包运行时生成物
+package/.env
+package/config/config.yaml
+package/runtime/*
+!package/runtime/.gitkeep
+package/generated/*
+!package/generated/.gitkeep
+package/logs/*
+!package/logs/.gitkeep

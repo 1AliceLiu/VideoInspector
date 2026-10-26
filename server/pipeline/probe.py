@@ -166,7 +166,9 @@ class SafetyProbe(BatchMetadataOperator):
                 if attrs:
                     obj.rect_params.border_width = 4  # nvosd 怪癖: 2 不上屏，见模块 docstring
                     obj.rect_params.border_color = RED
-                    self._set_osd_label(obj, " ".join(a.name for a in attrs))
+                    # 对外显示基础算法名，避免 __cam__ 内部规则名漏到预览
+                    labels = [self._rules[a.name].alert_type for a in attrs]
+                    self._set_osd_label(obj, " ".join(labels))
                 else:
                     obj.rect_params.border_width = _HIDE_BOX
                     obj.text_params.display_text = _HIDE_TEXT

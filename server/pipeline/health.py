@@ -109,6 +109,18 @@ class SourceHealthMonitor:
                 for i, t in enumerate(self._last_frame)
             }
 
+    def stats(self) -> dict[int, dict]:
+        """逐路帧计数 + 最近帧年龄（供控制面状态接口读取，O(路数)）。"""
+        now = time.monotonic()
+        with self._lock:
+            return {
+                i: {
+                    "frames": self._frames[i],
+                    "last_frame_age": None if t is None else now - t,
+                }
+                for i, t in enumerate(self._last_frame)
+            }
+
     def stalled(self, stall_seconds: float | None = None) -> set[int]:
         limit = self._stall_seconds if stall_seconds is None else stall_seconds
         return {i for i, age in self.snapshot().items()

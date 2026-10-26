@@ -1,0 +1,116 @@
+# =============================================================================
+# VideoInspector 控制面/检测服务配置模板
+# =============================================================================
+# 这是“期望状态”：控制面 API 会读写本文件，检测进程收到重载通知后重建管线。
+# 首次使用请复制为 config.yaml，并把 models/ 下的模型文件放好。
+# =============================================================================
+
+model:
+  person_conf_threshold: 0.6
+  gies:
+    person:
+      kind: detector
+      source: models/person/yolo26n.pt
+      uid: 1
+
+    helmet:
+      kind: detector
+      source: models/helmet/yolo26s_helm_20260804_0844/weights/best.pt
+      uid: 3
+      violation: head
+
+    harness_cls:
+      kind: classifier
+      source: models/harness/yolo26m_cls_harness_20260817_0547/weights/best.pt
+      uid: 5
+      violation: no_harness
+
+    vest_cls:
+      kind: classifier
+      source: models/vest/yolo26mcls_ppeVest_20260904_0959/weights/best.pt
+      uid: 6
+      violation: no_vest
+
+    smoke:
+      kind: detector
+      attach: person
+      source: models/smoke/yolo26m_smoking_20260707_0224/weights/best.pt
+      uid: 7
+      violation: cigarette
+
+rules:
+  no_helmet:
+    gie: helmet
+    cooldown_seconds: 10
+    min_detection_count: 3
+    attribute_threshold: 0.5
+
+  no_vest:
+    gie: vest_cls
+    cooldown_seconds: 300
+    min_detection_count: 15
+    attribute_threshold: 0.8
+
+  no_harness:
+    gie: harness_cls
+    cooldown_seconds: 30
+    min_detection_count: 5
+    attribute_threshold: 0.7
+
+  smoking:
+    gie: smoke
+    cooldown_seconds: 30
+    min_detection_count: 3
+    attribute_threshold: 0.75
+
+# 控制面 API 会写这个地址；请改成同事平台真实的 webhook 接收地址。
+webhook:
+  url: "http://host.docker.internal:6034/protal/ai-alarm/webhook"
+  timeout: 10
+  retries: 2
+  include_frame: true          # false = 告警不带 frame_base64，payload 更小
+  # secret: "change-me"        # 配置后 Webhook 会带 X-Signature
+
+cameras:
+  # 示例 1：直接给 RTSP 地址
+  - id: "1824"
+    name: "ZoneC_Outdoor_001"
+    source_mode: direct
+    rtsp_url: "rtsp://user:pass@camera.example.com:554/stream1"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
+  # 示例 2：ICC 设备编码 + 通道号（需要设置 SAFETY_ICC_RTSP_TEMPLATE）
+  - id: "1825"
+    name: "ZoneC_Outdoor_002"
+    device_code: "ICC-DEVICE-001"
+    channel_no: "2"
+    source_mode: icc
+    # 配置模板必须带 rtsp_url；通过 API 创建时如果给了模板，会自动拼好写进来。
+    rtsp_url: "rtsp://icc.example.com:554/ICC-DEVICE-001/2"
+    enabled: true
+    active_rules: ["no_helmet"]
+
+# -----------------------------------------------------------------------------
+# RTSP 输入参数（与主项目一致）
+# -----------------------------------------------------------------------------
+source:
+  rtsp_protocol: 4
+  drop_frame_interval: 1
+  reconnect:
+    attempts: 10
+    timeout: 10
+    interval: 10
+    latency: 500
+    stall_seconds: 180
+  health:
+    source_stall_seconds: 300
+    check_interval: 30
+    min_uptime_seconds: 120
+    rebuild_cost_seconds: 900
+    min_rebuild_interval: 1800
+    maintenance_window: "16:04"
+
+log:
+  level: "INFO"
+  file: "logs/server.log"

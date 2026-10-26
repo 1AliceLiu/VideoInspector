@@ -9,7 +9,8 @@
                          classifier 重写进 INI 的 classifier-threshold
 
 规则之间相互独立，各自维护状态机，互不竞争。
-规则名即 alert_type；合法性由 main.py 结合 model.gies 校验。
+`alert_type` 是 webhook 对外报警类型，未配置时等于规则名；按摄像头生成的
+`__cam__` 规则用它回指基础算法，避免 payload 泄漏内部规则名。
 """
 
 from __future__ import annotations
@@ -29,6 +30,9 @@ class RuleConfig:
     # OSD/payload 展示名（可选，预留字段）：未配置时回退为规则名。
     # 当前 OSD 与 payload 仍使用规则名（ASCII），渲染行为暂不改变。
     display_name: str | None = None
+    # 对外的报警类型（webhook alert_type）；未配置时等于规则名。
+    # 按摄像头生成的 __cam__ 规则用它回指基础算法，避免 payload 泄漏内部规则名。
+    alert_type: str | None = None
 
 
 def parse_rules(raw: dict | None) -> dict[str, RuleConfig]:
@@ -45,6 +49,7 @@ def parse_rules(raw: dict | None) -> dict[str, RuleConfig]:
         min_count = cfg.get("min_detection_count")
         threshold = cfg.get("attribute_threshold")
         display_name = cfg.get("display_name")
+        alert_type = cfg.get("alert_type")
         if not isinstance(gie, str) or not gie:
             raise ValueError(f"rules.{name}.gie 为必填项（引用 model.gies 名称）")
         if not isinstance(cooldown, (int, float)) or cooldown < 0:
@@ -55,6 +60,8 @@ def parse_rules(raw: dict | None) -> dict[str, RuleConfig]:
             raise ValueError(f"rules.{name}.attribute_threshold 必须是 0~1 的置信度")
         if display_name is not None and not isinstance(display_name, str):
             raise ValueError(f"rules.{name}.display_name 必须是字符串")
+        if alert_type is not None and (not isinstance(alert_type, str) or not alert_type):
+            raise ValueError(f"rules.{name}.alert_type 必须是非空字符串")
         rules[name] = RuleConfig(
             name=name,
             gie=gie,
@@ -62,5 +69,6 @@ def parse_rules(raw: dict | None) -> dict[str, RuleConfig]:
             min_detection_count=int(min_count),
             attribute_threshold=float(threshold),
             display_name=(display_name or name),
+            alert_type=(alert_type or name),
         )
     return rules

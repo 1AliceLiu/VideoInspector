@@ -2,6 +2,7 @@
 """DeepStream 管线构建器（源 → 推理链 → 分路输出）。"""
 
 from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 
 from pyservicemaker import Pipeline, Probe
@@ -86,8 +87,9 @@ class PipelineBuilder:
         rtsp_mounts = self._add_output_branches(p, out, frame_cache, logger)
 
         executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="webhook")
+        self.alert_managers = self._build_alert_managers(cfg, executor, logger)
         p.attach(last_infer, Probe("safety-probe", SafetyProbe(
-            self._build_alert_managers(cfg, executor, logger),
+            self.alert_managers,
             executor=executor,
             frame_cache=frame_cache,
             gies=self.gies, rules=self.rules,
@@ -115,6 +117,7 @@ class PipelineBuilder:
             "frame_cache": frame_cache,
             "executor": executor,
             "rtsp_server": rtsp_server,
+            "alert_managers": self.alert_managers,
         }
 
     # ------------------------------------------------------------------ 源
@@ -241,8 +244,14 @@ class PipelineBuilder:
 
     # ------------------------------------------------------------------ 告警
     def _active_rules_by_source(self) -> dict[int, set[str]]:
+        # 没有 active_rules 的摄像头默认跑“基础规则”，不要继承其他摄像头的
+        # __cam__ 按摄像头规则（否则会串参数）。
+        generated = set(
+            ((self.config.get("api_meta") or {}).get("generated_rules") or {}).keys()
+        )
+        defaults = [name for name in self.rules if name not in generated]
         return {
-            i: set(cam.get("active_rules") or list(self.rules))
+            i: set(cam.get("active_rules") or defaults)
             for i, cam in enumerate(self.cameras)
         }
 
@@ -254,8 +263,9 @@ class PipelineBuilder:
                 url=webhook_cfg["url"],
                 timeout=webhook_cfg.get("timeout", 10),
                 retries=webhook_cfg.get("retries", 2),
+                secret=webhook_cfg.get("secret") or os.environ.get("SAFETY_WEBHOOK_SECRET"),
             )
-            logger.debug("webhook configured: {}", webhook_cfg["url"])
+            logger.debug("webhook configured")
         else:
             logger.warning("未配置 Webhook URL，告警不会推送")
 
@@ -268,12 +278,32 @@ class PipelineBuilder:
                 camera_name=cam.get("name", cam["id"]),
                 rules=[self.rules[name] for name in names],
                 webhook=webhook,
+                device_code=cam.get("device_code"),
+                channel_no=cam.get("channel_no"),
+                include_frame=webhook_cfg.get("include_frame", True),
             )
             logger.info("startup camera={} src={} webhook={} active_rules={}",
-                        cam["id"], cam.get("rtsp_url"), bool(webhook), names)
+                        cam["id"], _mask_url(cam.get("rtsp_url")), bool(webhook), names)
         return managers
 
 
 def _resolve(base: Path, path: str) -> str:
     from server.config import resolve_path
     return resolve_path(base, path)
+
+
+def _mask_url(url: str | None) -> str | None:
+    """日志里隐藏 RTSP 密码，避免交付后凭据进日志。"""
+    if not url or "@" not in url:
+        return url
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parsed = urlsplit(url)
+        if parsed.password is None:
+            return url
+        netloc = f"{parsed.username or ''}:***@{parsed.hostname or ''}"
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    except Exception:
+        return url

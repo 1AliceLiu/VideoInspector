@@ -42,21 +42,72 @@ from server.config import EXIT_PIPELINE_STUCK, load_config
 from server.pipeline.ini_patch import anchor_ini_config as _anchor_ini_config  # noqa: F401
 
 
-def _run_supervised(config: dict, deploy_root: Path) -> int:
-    """监督循环：启动子进程；异常退出按退避策略重建。Ctrl-C 干净终止。"""
+def _runtime_dir(deploy_root: Path) -> Path:
+    return Path(os.environ.get("SAFETY_RUNTIME_DIR") or (deploy_root / "runtime"))
+
+
+def _read_revision(runtime_dir: Path) -> int:
+    try:
+        import json
+        return int(json.loads((runtime_dir / "revision.json").read_text(
+            encoding="utf-8"))["revision"])
+    except Exception:
+        return 0
+
+
+def _run_supervised(config_path: str, deploy_root: Path) -> int:
+    """监督循环：启动子进程；配置变更时优雅重启；异常退出按退避策略重建。"""
+    runtime_dir = _runtime_dir(deploy_root)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    reload_file = runtime_dir / "reload.request"
+    ready_file = runtime_dir / "ready"
+    last_reload_ns = reload_file.stat().st_mtime_ns if reload_file.exists() else 0
     attempt = 0
+
     while True:
         attempt += 1
+        try:
+            config = load_config(config_path)
+        except Exception as exc:
+            print(f"配置加载失败，监督循环退出: {exc}", flush=True)
+            return 1
+
+        revision = _read_revision(runtime_dir)
+        os.environ["SAFETY_CONFIG_REVISION"] = str(revision)
+        try:
+            ready_file.unlink()
+        except FileNotFoundError:
+            pass
+
         proc = Process(target=_child_target, args=(config, deploy_root),
                        name=f"safety-pipeline-{attempt}")
         proc.start()
+        reload_requested = False
         try:
-            proc.join()
+            while True:
+                proc.join(timeout=1)
+                if proc.exitcode is not None:
+                    break
+                if reload_file.exists() and reload_file.stat().st_mtime_ns > last_reload_ns:
+                    last_reload_ns = reload_file.stat().st_mtime_ns
+                    reload_requested = True
+                    print(f"收到配置重载请求 (revision={_read_revision(runtime_dir)})，"
+                          f"重启管线 process={proc.name}", flush=True)
+                    proc.terminate()
+                    proc.join(10)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join()
+                    break
         except KeyboardInterrupt:
             print("\nInterrupted. Terminating...")
             proc.terminate()
             proc.join()
             return 0
+
+        if reload_requested:
+            attempt = 0
+            continue
 
         exitcode = proc.exitcode
         if exitcode is None or exitcode == 0:
@@ -85,10 +136,11 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"加载配置: {args.config}")
-    config = load_config(args.config)
-    deploy_root = Path(args.config).resolve().parent
-    return _run_supervised(config, deploy_root)
+    config_path = str(Path(args.config).resolve())
+    print(f"加载配置: {config_path}")
+    load_config(config_path)  # 启动前 fail fast；监督循环会按需重新加载
+    deploy_root = Path(config_path).parent
+    return _run_supervised(config_path, deploy_root)
 
 
 if __name__ == "__main__":

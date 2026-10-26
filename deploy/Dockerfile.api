@@ -1,0 +1,31 @@
+# =============================================================================
+# 控制面 API 镜像（独立于 DeepStream，不需要 GPU）
+# =============================================================================
+# 只负责：摄像头/算法配置、异步变更、RTSP 探测、状态查询。
+# 不包含检测模型，也不直接操作视频流。
+# =============================================================================
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+# ffprobe 用于 RTSP 探测；没有它时会退回 RTSP OPTIONS 探测
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY deploy/requirements-api.txt ./
+RUN pip install --no-cache-dir -r requirements-api.txt
+
+COPY server/ ./server/
+COPY API-v1.md ./API-v1.md
+
+EXPOSE 8080
+
+CMD ["python3", "-m", "server.api.control_plane", \
+     "--config", "/app/deploy/config/config.yaml", \
+     "--runtime-dir", "/app/deploy/runtime", \
+     "--host", "0.0.0.0", "--port", "8080"]
