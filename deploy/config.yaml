@@ -266,6 +266,30 @@ cameras:
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1000363"
     enabled: true
     active_rules: ["no_helmet"]
+
+  - id: "1096"
+    name: "AI Camera1096"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001052"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]  
+  
+  - id: "1912"
+    name: "AI Camera1912"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1002734"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]
+
+  - id: "1168"
+    name: "AI Camera1168"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001103"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]
+
+  - id: "1731"
+    name: "AI Camera1731"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001816"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"] 
 # -----------------------------------------------------------------------------
 # RTSP 输入
 # -----------------------------------------------------------------------------
