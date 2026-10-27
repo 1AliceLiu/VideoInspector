@@ -195,7 +195,6 @@ class ApplyWorker:
             return
 
         previous = self.store.read()
-        backup = self.store.backup(previous)
         candidate = op.get("candidate")
         if not isinstance(candidate, dict):
             self.operations.update(
@@ -203,6 +202,13 @@ class ApplyWorker:
                 error={"code": "INVALID_CANDIDATE", "message": "变更内容为空"},
             )
             return
+        if candidate == previous:
+            self.operations.update(
+                op, status="succeeded", config_revision=self.store.revision(),
+                finished_at=now_iso(), error=None,
+            )
+            return
+        backup = self.store.backup(previous)
 
         try:
             self.store.write_raw(candidate)

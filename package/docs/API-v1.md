@@ -1,10 +1,10 @@
 # 视频检测开放 API v1（待确认）
 
-> 版本：v1.1-draft  
-> 日期：2026-10-23  
+> 版本：v1.2-draft  
+> 日期：2026-10-27  
 > 状态：根据同事反馈修订，待最终确认  
 > 说明：本文档只定义对外契约，不包含内部实现细节。  
-> 第一版 Docker 包（v0.1）已实现大部分接口；classifier 按摄像头 `profile` 暂未开放，详见 `package/README.md`。
+> 当前交付版本 v0.2：已实现摄像头管理、算法绑定、区域限制（zones）与区域入侵（intrusion）、状态查询等接口；classifier 按摄像头 `profile` 暂未开放，详见 `package/README.md`。
 
 ## 0. 接口总览
 
@@ -146,7 +146,7 @@
 | `cooldown_seconds` | 全部 | 同一摄像头同一规则的告警冷却秒数 |
 | `min_detection_count` | 全部 | 连续多少帧命中才触发，越大越稳、越迟钝 |
 | `attribute_threshold` | detector 类（如 `no_helmet`、`smoking`） | 违规置信度门限，0~1 |
-| `profile` | classifier 类（如 `no_vest`、`no_harness`） | 严格程度档位：`loose` / `normal` / `strict`；**v0.1 暂未开放按摄像头配置** |
+| `profile` | classifier 类（如 `no_vest`、`no_harness`） | 严格程度档位：`loose` / `normal` / `strict`；**v0.2 暂未开放按摄像头配置** |
 | `zones` | 全部 | 空间作用域：归一化多边形列表。**省略 = 全图判定**；给出 = 仅区域内命中才告警。`intrusion` 必须给出 |
 | `vacant_frames` | 仅 `intrusion` | 离开去抖帧数：区域内连续 N 帧无人才算本次事件结束，等待下一次进入 |
 
@@ -161,6 +161,7 @@
 - `id` 建议沿用平台 `RuleId`（如 `r9-1`），命中后会原样出现在告警 payload 的
   `zones` 里，便于与标定侧对齐。
 - 同一算法可配多个区域，命中任一即算区域内。
+- 可直接传平台标定条目（`RuleId` + `Points: [{X, Y}]`），服务端会统一保存为 `id` + `points: [[x, y]]` 并回显。
 
 **`intrusion`（区域入侵）的告警节奏** —— 与 PPE 类算法不同，请按「事件」而非「电平」理解：
 
@@ -171,7 +172,7 @@
 - `cooldown_seconds` 对 `intrusion` 不是冷却而是「并入窗口」，建议 `0`；
   设 >0 会把窗口内的新一次进入并入上一条，不单独成单。
 
-**classifier 阈值说明**：分类器的阈值目前写死在模型配置里，v0.1 不支持按摄像头传任意数值，也不支持按摄像头选 `profile`；当前只支持 `cooldown_seconds` 和 `min_detection_count` 按摄像头调。`profile` 字段先保留在契约里，下一版再实现。实现时需要增加全局分类器实例，档位越多 GPU 开销越高，建议最多 3 档。
+**classifier 阈值说明**：分类器的阈值目前写死在模型配置里，v0.2 不支持按摄像头传任意数值，也不支持按摄像头选 `profile`；当前只支持 `cooldown_seconds` 和 `min_detection_count` 按摄像头调。`profile` 字段先保留在契约里，下一版再实现。实现时需要增加全局分类器实例，档位越多 GPU 开销越高，建议最多 3 档。
 
 ## 3. 摄像头对象
 
@@ -405,7 +406,7 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
 - 至少 1 个；要停用全部算法请用 `PATCH enabled:false`。
 - 解绑算法不会降低 GPU 占用，所有模型仍在对所有摄像头推理。
 - 参数省略时用算法目录里的默认值；传了则只覆盖该摄像头的该算法。
-- 如果新配置和当前完全一致，直接返回 `succeeded`，不触发重建。
+- 如果新配置和当前完全一致：仍返回 `202`，但 operation 很快变为 `succeeded`，不写配置、不递增 `config_revision`、不重启管线。
 
 ### 9.1 参数覆盖规则
 
@@ -414,7 +415,9 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
 | `cooldown_seconds` | 按摄像头 | 只影响该路告警节奏 |
 | `min_detection_count` | 按摄像头 | 复杂场景可调大，减少误报 |
 | `attribute_threshold` | 按摄像头，仅 detector 类 | 如 `no_helmet`、`smoking` |
-| `profile` | 按摄像头，仅 classifier 类；v0.1 暂未开放 | `loose` / `normal` / `strict`，下一版实现 |
+| `profile` | 按摄像头，仅 classifier 类；v0.2 暂未开放 | `loose` / `normal` / `strict`，下一版实现 |
+| `zones` | 按摄像头，全部算法 | 归一化区域列表；省略=全图；`intrusion` 必须给出，见 9.2 |
+| `vacant_frames` | 按摄像头，仅 `intrusion` | 离开去抖帧数，见第 2 节 |
 
 约束：
 
@@ -422,6 +425,44 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
 - 不允许传算法目录里没有的参数。
 - classifier 的 `profile` 是离散档位，不支持任意数值；每增加一个档位，后端会增加对应模型实例，GPU 开销上升。
 - 参数变更会触发管线重建，全流中断时间与第 1 节一致。
+
+### 9.2 区域（zones）
+
+区域是算法的空间作用域：配置了区域的算法，只有**人员脚底中点（`anchor: feet`）落在区域内**时才参与告警；省略 `zones` 则全图判定。
+
+示例 1：区域入侵（`intrusion` 必须带区域），区域来自平台标定条目 `r9-1`，同时保留全图安全帽检测：
+
+```json
+{
+  "algorithms": [
+    {"id": "no_helmet"},
+    {"id": "intrusion", "params": {
+      "zones": [
+        {"id": "r9-1", "anchor": "feet", "points": [
+          [0.2943, 0.3311], [0.4398, 0.3408], [0.5252, 0.6883],
+          [0.5066, 0.9835], [0.0055, 0.9874], [0.0044, 0.6981]
+        ]}
+      ],
+      "vacant_frames": 50
+    }}
+  ]
+}
+```
+
+示例 2：把安全帽检测收窄到区域内（同样的区域写法，挂在 `no_helmet` 上）：
+
+```json
+{"algorithms": [{"id": "no_helmet", "params": {"zones": [
+  {"id": "r9-1", "points": [[0.29, 0.33], [0.44, 0.34], [0.53, 0.69], [0.51, 0.98], [0.01, 0.99], [0.00, 0.70]]}
+]}}]}
+```
+
+规则：
+
+- `intrusion` 必须带 `zones`，缺少时返回 `400 CONFIG_INVALID`，不会进入变更流程。
+- 区域顶点少于 3 个、坐标不在 0~1、多边形自交，返回 `422 INVALID_PARAM`，`message` 说明具体原因。
+- 响应中的 `zones` 统一为 `{id, anchor, points}` 形态；平台原始的 `RuleId/Points` 写入后也会被转换。
+- 更新区域：再次 `PUT` 完整的 `algorithms` 列表（全量替换）。去掉区域：该算法的 `params` 不再带 `zones`（`no_helmet` 会恢复全图判定）。
 
 ## 10. 查询变更结果
 
@@ -549,7 +590,7 @@ Payload：
 ## 14. v1 不包含
 
 - 新算法/新模型上传、编译、上架（走内部审核）。
-- classifier 类算法按摄像头传任意阈值或 `profile`（v0.1 只支持 `cooldown_seconds` / `min_detection_count`）。
+- classifier 类算法按摄像头传任意阈值或 `profile`（v0.2 只支持 `cooldown_seconds` / `min_detection_count`）。
 - 非 RTSP 输入（GB28181/WebRTC/推流）；ICC 和转发服务最终都需提供可拉取的 RTSP 地址。
 - 单帧图片推理 API（`POST /v1/infer`）。
 - 多租户自助开通；本服务单租户，分发由同事平台自己做。
@@ -571,3 +612,4 @@ Payload：
 | --- | --- | --- |
 | 2026-10-23 | v1-draft | 初稿 |
 | 2026-10-23 | v1.1-draft | 根据反馈：probe 进 v1；增加 `device_code`/`channel_no`、ICC/转发源、按摄像头参数、状态字段、Webhook 签名与 `event_id`；明确单租户 |
+| 2026-10-27 | v1.2-draft | 区域限制（zones）写入契约：区域统一返回 `{id, anchor, points}`，接受平台 `RuleId/Points` 形态；`intrusion` 区域入侵与 `vacant_frames`；告警 `zones` / `attributes[].zone` 字段；交付版本 v0.2 |

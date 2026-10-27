@@ -104,6 +104,26 @@ rules:
     vacant_frames: 50
     attribute_threshold: 0.5      # presence 不使用；校验器要求必填，占位
     alert_type: intrusion
+  # 2628 区域入侵（按摄像头生成，区域 r9-1 来自 2628-area.txt；重标请用 tools/area_import.py）
+  __cam__2628__43e2c7a7__intrusion:
+    gie: person
+    trigger: presence
+    cooldown_seconds: 0
+    min_detection_count: 5
+    vacant_frames: 50
+    attribute_threshold: 0.5
+    alert_type: intrusion
+    zones:
+    - id: r9-1
+      anchor: feet
+      points:
+      - [0.2943, 0.3311]
+      - [0.4398, 0.3408]
+      - [0.5252, 0.6883]
+      - [0.5066, 0.9835]
+      - [0.0055, 0.9874]
+      - [0.0044, 0.6981]
+    display_name: intrusion
 
 # -----------------------------------------------------------------------------
 # Webhook 告警推送（alert_type 为触发的规则名，如 "no_vest"）
@@ -235,7 +255,7 @@ cameras:
     name: "AI Camera2628"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1003113"
     enabled: true
-    active_rules: ["no_helmet"]
+    active_rules: ["no_helmet", "__cam__2628__43e2c7a7__intrusion"]
 
   - id: "2633"
     name: "AI Camera2633"
@@ -366,3 +386,10 @@ log:
   # 而被淘汰」的命中，用于区分「模型没检出」与「检出后被区域门挡下」。
   # 仅在配置了区域的路上有意义，且逐帧写日志 —— 标定完请关掉恢复 INFO。
   out_of_zone: false
+
+# 控制面元数据：__cam__ 生成规则回指基础算法（勿删，否则 API 视图丢失 intrusion）
+api_meta:
+  generated_rules:
+    __cam__2628__43e2c7a7__intrusion:
+      camera_id: '2628'
+      algorithm: intrusion

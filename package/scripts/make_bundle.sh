@@ -7,7 +7,7 @@ set -euo pipefail
 
 PACKAGE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_ROOT="$(cd "$PACKAGE_DIR/.." && pwd)"
-VERSION="${VERSION:-v0.1}"
+VERSION="${VERSION:-v0.2}"
 BUNDLE_NAME="video-inspector-api-${VERSION}"
 DIST_DIR="${PACKAGE_DIR}/dist"
 BUNDLE="${DIST_DIR}/${BUNDLE_NAME}"

@@ -82,7 +82,7 @@ def _probe_options(url: str, timeout: float) -> dict:
     headers = [
         f"OPTIONS {request_url} RTSP/1.0",
         "CSeq: 1",
-        "User-Agent: VideoInspector/0.1",
+        "User-Agent: VideoInspector/0.2",
     ]
     if parsed.username is not None:
         credentials = f"{parsed.username}:{parsed.password or ''}".encode("utf-8")

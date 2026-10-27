@@ -20,7 +20,7 @@ nvstreammux 未启用 enable-padding（拉伸填满 1920x1080），拉伸对归�
 
 用法:
     # 影子实例配置（区域内联在 rules 上）
-    python3 tools/preview_zone.py --config deploy/config.2628-test.yaml --camera 2628
+    python3 tools/preview_zone.py --config deploy/config.yaml --camera 2628
 
     # 生产配置（区域由 tools/area_import.py 生成的 __cam__ 规则携带，同样能读）
     python3 tools/preview_zone.py --config deploy/config.yaml --camera 2628
@@ -29,7 +29,7 @@ nvstreammux 未启用 enable-padding（拉伸填满 1920x1080），拉伸对归�
     python3 tools/preview_zone.py --area 2628-area.txt --image snapshot-2628.jpg
 
     # 不碰流、也不画图，只核对几何
-    python3 tools/preview_zone.py --config deploy/config.2628-test.yaml --camera 2628 --stats-only
+    python3 tools/preview_zone.py --config deploy/config.yaml --camera 2628 --stats-only
 """
 
 from __future__ import annotations

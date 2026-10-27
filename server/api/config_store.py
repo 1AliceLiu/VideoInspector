@@ -22,7 +22,7 @@ import yaml
 
 from server.config import validate_config
 from server.alert.regions import parse_zones
-from server.model_spec import KIND_DETECTOR, parse_gies
+from server.model_spec import KIND_CLASSIFIER, KIND_DETECTOR, parse_gies
 from server.api.errors import ApiError
 from server.api.util import atomic_write_json, atomic_write_text, mask_rtsp_url, now_iso
 
@@ -36,6 +36,14 @@ MAX_CAMERAS = 32  # 与 tools/model_build.py 的引擎 max_batch 一致
 
 def _safe_token(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", value)
+
+
+def _canonical_zones(raw) -> list[dict]:
+    """区域统一写成契约形态 {id, anchor, points: [[x, y], ...]}；平台 RuleId/Points 形态也接受。"""
+    return [
+        {"id": z.id, "anchor": z.anchor, "points": [[x, y] for x, y in z.points]}
+        for z in parse_zones(raw, where="zones")
+    ]
 
 
 def _locked(method):
@@ -183,7 +191,7 @@ class ConfigStore:
                     "enum": ["loose", "normal", "strict"],
                     "default": "normal",
                     "supported": False,
-                    "note": "v0.1 仅支持全局配置；按摄像头阈值需要下一版",
+                    "note": "v0.2 仅支持全局配置；按摄像头阈值需要下一版",
                 }
             # 区域能力：省略 zones = 全图生效；presence 型（区域入侵）必须给出
             schema["zones"] = {
@@ -430,6 +438,8 @@ class ConfigStore:
             if not params:
                 active.append(alg_id)
                 continue
+            if "zones" in params:
+                params = {**params, "zones": _canonical_zones(params["zones"])}
 
             token = _safe_token(str(cam["id"]))
             digest = hashlib.sha1(str(cam["id"]).encode("utf-8")).hexdigest()[:8]
@@ -460,7 +470,7 @@ class ConfigStore:
         if "profile" in params:
             raise ApiError(
                 422, "UNSUPPORTED_PARAM",
-                f"算法 {alg_id} 的 profile 参数暂未在 v0.1 开放；"
+                f"算法 {alg_id} 的 profile 参数暂未在 v0.2 开放；"
                 "请用 cooldown_seconds/min_detection_count，或等下一版",
             )
         # 区域：结构与取值复用运行期同一套解析（server/alert/regions.parse_zones），

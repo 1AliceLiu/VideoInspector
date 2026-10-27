@@ -63,6 +63,17 @@ rules:
     min_detection_count: 3
     attribute_threshold: 0.75
 
+  # 区域入侵（presence 型）模板：不绑定任何摄像头，仅让 GET /v1/algorithms 列出它。
+  # 绑定到某路时必须通过 API 传 zones（见 docs/API-v1.md 第 9 节），缺 zones 会被拒绝。
+  intrusion:
+    gie: person
+    trigger: presence
+    cooldown_seconds: 0
+    min_detection_count: 5
+    vacant_frames: 50
+    attribute_threshold: 0.5      # presence 不使用；校验器要求必填，占位
+    alert_type: intrusion
+
 # 控制面 API 会写这个地址；请改成同事平台真实的 webhook 接收地址。
 webhook:
   url: "http://host.docker.internal:6034/protal/ai-alarm/webhook"
@@ -90,6 +101,12 @@ cameras:
     rtsp_url: "rtsp://icc.example.com:554/ICC-DEVICE-001/2"
     enabled: true
     active_rules: ["no_helmet"]
+
+  # 示例 3（区域）：区域不在这里手写，通过 API 绑定，例如：
+  #   PUT /v1/cameras/1824/algorithms
+  #   {"algorithms": [{"id": "intrusion", "params": {"zones": [
+  #       {"id": "r9-1", "points": [[0.29, 0.33], [0.44, 0.34], [0.53, 0.69], [0.51, 0.98], [0.01, 0.99], [0.00, 0.70]]}
+  #   ]}}]}
 
 # -----------------------------------------------------------------------------
 # RTSP 输入参数（与主项目一致）

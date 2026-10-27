@@ -1,4 +1,4 @@
-# VideoInspector API 交付包 v0.1
+# VideoInspector API 交付包 v0.2
 
 这是给同事的“私有化 Docker 包”：包含现有检测程序、控制面 API、配置模板和说明。
 同事拿回去后，用自己的 GPU 服务器运行；检测算法和模型仍然在本地，不经过你们的服务器。
@@ -239,10 +239,31 @@ curl -H "Authorization: Bearer $KEY" $API/v1/cameras
 - `last_alert_at`
 - `algorithm_versions`
 
-## 8. v0.1 做了什么、没做什么
+### 7.7 画区域（区域入侵 / 限定算法区域）
+
+区域坐标用归一化 0~1（相对画面宽高），可直接填平台标定文件里的 `Points[].X/Y`。下面把摄像头 2628 的区域 `r9-1` 绑定为区域入侵，同时保留全图安全帽检测（摄像头需已存在）：
+
+```bash
+curl -X PUT $API/v1/cameras/2628/algorithms \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"algorithms": [
+        {"id": "no_helmet"},
+        {"id": "intrusion", "params": {"zones": [
+          {"id": "r9-1", "points": [[0.2943,0.3311],[0.4398,0.3408],[0.5252,0.6883],[0.5066,0.9835],[0.0055,0.9874],[0.0044,0.6981]]}
+        ]}}
+      ]}'
+```
+
+返回 `202` 后用 `operation_id` 查结果。区域的完整规则（锚点、去抖、错误码）见 `docs/API-v1.md` 第 9.2 节。
+
+## 8. v0.2 做了什么、没做什么
 
 ### 已实现
 
+- **区域限制（zones）**：任意算法可绑定 0..N 个归一化多边形；不绑定 = 全图判定
+- **区域入侵（intrusion）**：区域内有人即告警；同一次进入只报 1 条，离开后再进入报新的 1 条（`vacant_frames` 去抖）
+- 告警带 `zones`（回指标定的 `RuleId`）和 `objects[].attributes[].zone`
 - 摄像头增删改查、启停
 - 绑定/替换已有算法
 - 按摄像头调 `cooldown_seconds`、`min_detection_count`
@@ -253,6 +274,13 @@ curl -H "Authorization: Bearer $KEY" $API/v1/cameras
 - 状态查询（在线、帧间隔、帧率、最后告警、算法版本）
 - ICC 设备编码/通道号 + 转发 RTSP 两种来源
 - Webhook `event_id`、`schema_version`、设备编码/通道号、HMAC 签名
+
+### 8.1 从 v0.1 升级到 v0.2
+
+1. 替换交付包；模型包不变，继续使用 v0.1 的模型包。
+2. v0.1 的 `config/config.yaml` 没有 `intrusion` 模板规则。要使用区域入侵，把 `config/config.example.yaml` 里的 `intrusion` 段复制到 `config/config.yaml` 的 `rules:` 下面。这一步不会改变现有摄像头的判定，因为没有摄像头引用它。
+3. 执行 `./scripts/build.sh && ./scripts/start.sh`（镜像标签变为 `0.2`）。
+4. `curl -H "Authorization: Bearer $KEY" $API/v1/algorithms` 能看到 `intrusion`，说明模板已生效。
 
 ### 暂未实现
 
@@ -318,8 +346,8 @@ cd package
 产物在 `package/dist/`：
 
 ```text
-video-inspector-api-v0.1.tar.gz
-video-inspector-api-v0.1.tar.gz.sha256
+video-inspector-api-v0.2.tar.gz
+video-inspector-api-v0.2.tar.gz.sha256
 ```
 
 默认不包含模型（模型体积大、属于算法资产）。如果需要连模型一起打包：
@@ -331,8 +359,8 @@ WITH_MODELS=1 ./scripts/make_bundle.sh
 同事解压后：
 
 ```bash
-tar -xzf video-inspector-api-v0.1.tar.gz
-cd video-inspector-api-v0.1/package
+tar -xzf video-inspector-api-v0.2.tar.gz
+cd video-inspector-api-v0.2/package
 ./scripts/init.sh
 ```
 
@@ -349,7 +377,7 @@ cd video-inspector-api-v0.1/package
 如果同事机器不能联网，先在能联网的机器上构建镜像，再导出：
 
 ```bash
-docker save video-inspector-detector:0.1 video-inspector-api:0.1 -o video-inspector-v0.1.tar
+docker save video-inspector-detector:0.2 video-inspector-api:0.2 -o video-inspector-v0.2.tar
 ```
 
 注意：TensorRT 引擎和 GPU/驱动/TensorRT 版本绑定，**不能把 `generated/` 直接拷到不同 GPU 的机器上**，目标机器首次启动会自动重建。

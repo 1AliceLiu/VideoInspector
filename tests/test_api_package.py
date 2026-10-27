@@ -103,6 +103,34 @@ class ConfigStoreTest(unittest.TestCase):
             ]})
         self.assertEqual(ctx.exception.status, 422)
 
+    def test_algorithm_catalog_covers_classifier_and_presence(self):
+        raw = self.store.read()
+        raw["rules"]["intrusion"] = {
+            "gie": "person", "trigger": "presence", "cooldown_seconds": 0,
+            "min_detection_count": 5, "vacant_frames": 50, "attribute_threshold": 0.5,
+        }
+        self.store.write_raw(raw)
+        items = {item["id"]: item for item in self.store.list_algorithms()}
+        self.assertEqual(items["no_vest"]["kind"], "classifier")
+        self.assertIn("profile", items["no_vest"]["params_schema"])
+        self.assertTrue(items["intrusion"]["params_schema"]["zones"]["required"])
+        self.assertIn("vacant_frames", items["intrusion"]["params_schema"])
+
+    def test_zones_normalized_to_contract_shape(self):
+        candidate = self.store.set_algorithms("c1", {"algorithms": [
+            {"id": "no_helmet", "params": {"zones": [
+                {"RuleId": "r9-1", "Points": [{"X": 0.2943, "Y": 0.3311}, {"X": 0.4398, "Y": 0.3408},
+                                              {"X": 0.5252, "Y": 0.6883}, {"X": 0.0044, "Y": 0.6981}]},
+                {"points": [[0.1, 0.1], [0.3, 0.1], [0.2, 0.3]]},
+            ]}},
+        ]})
+        self.store.write_raw(candidate)
+        zones = self.store.get_camera("c1")["algorithms"][0]["params"]["zones"]
+        self.assertEqual(zones[0], {"id": "r9-1", "anchor": "feet", "points": [
+            [0.2943, 0.3311], [0.4398, 0.3408], [0.5252, 0.6883], [0.0044, 0.6981]]})
+        self.assertEqual(zones[1], {"id": "z2", "anchor": "feet", "points": [
+            [0.1, 0.1], [0.3, 0.1], [0.2, 0.3]]})
+
     def test_rtsp_password_masked(self):
         self.assertEqual(self.store.get_camera("c1")["rtsp_url"], "rtsp://u:***@host/s")
 
@@ -174,6 +202,14 @@ class ApiTest(unittest.TestCase):
             "GET", f"/v1/operations/{payload['operation_id']}", key="test-key")
         self.assertEqual(status, 200)
         self.assertNotIn("candidate", operation)
+
+    def test_identical_config_skips_reload(self):
+        revision_before = self.store.revision()
+        op = self.ops.create("bind_algorithms", "c1", self.store.read())
+        self.worker._run(op)
+        done = self.ops.get(op["operation_id"])
+        self.assertEqual(done["status"], "succeeded")
+        self.assertEqual(self.store.revision(), revision_before)
 
     def test_unknown_algorithm_rejected(self):
         status, payload = self._request("POST", "/v1/cameras", {

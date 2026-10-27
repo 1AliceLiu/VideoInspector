@@ -253,11 +253,11 @@ class TestRuleValidation(unittest.TestCase):
             validate_config(cfg, Path("<test>"))
         self.assertIn("锚点检测器", str(ctx.exception))
 
-    def test_2628_shadow_config_is_valid(self):
+    def test_2628_config_is_valid(self):
         import yaml
-        with open("deploy/config.2628-test.yaml", encoding="utf-8") as f:
+        with open("deploy/config.yaml", encoding="utf-8") as f:
             raw = yaml.safe_load(f)
-        validate_config(raw, Path("deploy/config.2628-test.yaml"))
+        validate_config(raw, Path("deploy/config.yaml"))
 
 
 # ==================================================================== 探针

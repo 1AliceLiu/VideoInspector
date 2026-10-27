@@ -53,7 +53,7 @@ class ControlPlaneServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "VideoInspectorAPI/0.1"
+    server_version = "VideoInspectorAPI/0.2"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):

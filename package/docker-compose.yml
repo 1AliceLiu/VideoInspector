@@ -5,7 +5,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: video-inspector-detector:0.1
+    image: video-inspector-detector:0.2
     pull_policy: build
     container_name: video-inspector-detector
     privileged: true
@@ -38,7 +38,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.api
-    image: video-inspector-api:0.1
+    image: video-inspector-api:0.2
     pull_policy: build
     container_name: video-inspector-api
     environment:
