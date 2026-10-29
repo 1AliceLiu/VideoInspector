@@ -135,6 +135,24 @@ webhook:
   retries: 2                                    # 失败重试次数
 
 # -----------------------------------------------------------------------------
+# VLM 二级复核（吸烟告警大模型门控，见 server/alert/vlm_review.py）
+# shadow=true：只观察不拦截——判定进日志、payload 不附字段、告警照推，
+# 核对一周 verdict 对错后再改 false 启用拦截（灰度方案见 proposals/vlm-review/README.md）。
+# url 用容器网络 DNS 名 vllm（GPU3 全机共享服务，宿主机测试走 127.0.0.1:8013）。
+# -----------------------------------------------------------------------------
+vlm:
+  enabled: true
+  shadow: true
+  url: http://vllm:8013/v1/chat/completions
+  model: /model/Qwen2.5-VL-7B-Instruct-AWQ
+  rules: [smoking]
+  frames: 4
+  sample_ms: 120
+  deadline_ms: 1500
+  pad: 0.15
+  fail_open: true
+
+# -----------------------------------------------------------------------------
 # 摄像头列表
 # -----------------------------------------------------------------------------
 # 多路 RTSP 输入（引擎为动态 batch，支持任意路数；每路一个 AlertManager）。
@@ -249,7 +267,7 @@ cameras:
     name: "AI Camera0670"
     rtsp_url: "rtsp://192.168.1.16:9090/dss/monitor/params?cameraid=1005322%240&substream=1"
     enabled: true
-    active_rules: ["no_vest","no_helmet"]
+    active_rules: ["no_vest"]
 
   - id: "2628"
     name: "AI Camera2628"
@@ -310,6 +328,30 @@ cameras:
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1001816"
     enabled: true
     active_rules: ["no_helmet", "no_vest", "smoking"] 
+
+  - id: "2666"
+    name: "AI Camera2666"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003156"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"] 
+
+  - id: "2667"
+    name: "AI Camera2667"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003157"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"] 
+
+  - id: "2668"
+    name: "AI Camera2668"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003158"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"] 
+
+  - id: "2669"
+    name: "AI Camera2669"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003159"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"] 
 # -----------------------------------------------------------------------------
 # RTSP 输入
 # -----------------------------------------------------------------------------
@@ -349,7 +391,7 @@ source:
   rtsp_protocol: 4
   # 解码侧抽帧（全局）：每 N 帧只放行 1 帧。1=不抽帧（默认）；吞吐实验时改 2 / 4。
   # 由 builder 注入 nvurisrcbin drop-frame-interval，N 倍降低 decode→infer→OSD/appsink 负载。
-  drop_frame_interval: 1
+  drop_frame_interval: 2
   reconnect:
     attempts: 10
     timeout: 10

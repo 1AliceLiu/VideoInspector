@@ -231,7 +231,7 @@ def build_one(name: str, source: str, uid: int, kind: str, violation: str | None
     h, w = model_imgsz(model)
     is_classify = (kind == KIND_CLASSIFIER)
     is_sgie_det = (kind == KIND_DETECTOR and attach is not None)
-    max_batch = 32
+    max_batch = 64
 
     # violation 校验 + 标签顺序（class0 前置；权重交换只在真正导出时做；
     # classifier 的 violation 由 parse_gies 保证必填）

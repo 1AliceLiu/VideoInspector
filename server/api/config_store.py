@@ -31,7 +31,7 @@ CAMERA_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ALLOWED_PARAMS = ("cooldown_seconds", "min_detection_count", "attribute_threshold",
                   "zones", "vacant_frames")
 MAX_HISTORY = 20
-MAX_CAMERAS = 32  # 与 tools/model_build.py 的引擎 max_batch 一致
+MAX_CAMERAS = 64  # 与 tools/model_build.py 的引擎 max_batch 一致
 
 
 def _safe_token(value: str) -> str:

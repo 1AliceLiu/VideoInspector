@@ -99,7 +99,7 @@ class PipelineBuilder:
         rtsp_mounts = self._add_output_branches(p, out, frame_cache, logger)
 
         executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="webhook")
-        self.alert_managers = self._build_alert_managers(cfg, executor, logger)
+        self.alert_managers = self._build_alert_managers(cfg, executor, logger, frame_cache)
 
         # 区域标定期排障日志：仅当「本部署真的配了区域」且显式开了 log.out_of_zone
         # 才逐帧记录「违规成立但在区域外被淘汰」——现场用来区分「模型没检出」与
@@ -279,7 +279,8 @@ class PipelineBuilder:
             for i, cam in enumerate(self.cameras)
         }
 
-    def _build_alert_managers(self, config: dict, executor, logger) -> dict[int, AlertManager]:
+    def _build_alert_managers(self, config: dict, executor, logger,
+                              frame_cache) -> dict[int, AlertManager]:
         webhook_cfg = config.get("webhook") or {}
         webhook = None
         if webhook_cfg.get("url"):
@@ -305,6 +306,9 @@ class PipelineBuilder:
                 device_code=cam.get("device_code"),
                 channel_no=cam.get("channel_no"),
                 include_frame=webhook_cfg.get("include_frame", True),
+                vlm=config.get("vlm"),
+                frame_cache=frame_cache,
+                source_id=i,
             )
             logger.info("startup camera={} src={} webhook={} active_rules={}",
                         cam["id"], _mask_url(cam.get("rtsp_url")), bool(webhook), names)

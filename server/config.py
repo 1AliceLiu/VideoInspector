@@ -99,6 +99,16 @@ def validate_config(config: dict, path: Path):
                         "请为该摄像头配置区域，或从 active_rules 中移除该规则"
                     )
 
+    # VLM 复核（吸烟等告警二次确认，见 alert/vlm_review.py）：开启时 url 必填，
+    # rules 必须引用已定义规则，防止启动后复核门静默失效。
+    vlm_cfg = config.get("vlm") or {}
+    if vlm_cfg.get("enabled"):
+        if not vlm_cfg.get("url"):
+            errors.append("vlm.enabled=true 时 vlm.url 为必填项（OpenAI 兼容 /v1/chat/completions）")
+        unknown = [r for r in vlm_cfg.get("rules") or [] if r not in rule_names]
+        if unknown:
+            errors.append(f"vlm.rules 引用了未定义的规则: {unknown}")
+
     webhook = config.get("webhook") or {}
     timeout = webhook.get("timeout")
     if webhook.get("url") and timeout is not None and not (

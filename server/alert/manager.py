@@ -21,6 +21,7 @@ import simplejpeg
 from loguru import logger
 
 from server.metadata import ObjectMeta
+from server.alert import vlm_review
 from server.alert.regions import Zone
 from server.alert.rules import RuleConfig, TRIGGER_PRESENCE
 from server.alert.webhook import WebhookAlerter
@@ -164,6 +165,9 @@ class AlertManager:
         device_code: str | None = None,
         channel_no: str | None = None,
         include_frame: bool = True,
+        vlm: dict | None = None,
+        frame_cache=None,
+        source_id: int | None = None,
     ):
         """
         Args:
@@ -173,6 +177,9 @@ class AlertManager:
             webhook: Webhook 推送实例，None 则不推送
             device_code: ICC 设备编码（可选，随 webhook 输出）
             channel_no: ICC 通道号（可选，随 webhook 输出）
+            vlm: config vlm 节（enabled 时生效，见 alert/vlm_review.py）
+            frame_cache: 证据帧缓存（VLM 复核连拍采样用）
+            source_id: 本路在管线中的流序号（查 frame_cache 用）
         """
         self.camera_id = camera_id
         self.camera_name = camera_name
@@ -180,6 +187,11 @@ class AlertManager:
         self.channel_no = channel_no
         self.include_frame = include_frame
         self.webhook = webhook
+        # VLM 复核（可选）：vlm.enabled 且规则在 vlm.rules 内才走复核门；
+        # frame_cache/source_id 缺失（如单测外的旧调用方）时复核不可用，自动回退直推。
+        self.vlm = vlm if vlm and vlm.get("enabled") else None
+        self.frame_cache = frame_cache if self.vlm is not None else None
+        self.source_id = source_id
         # 最近一次告警（供控制面状态查询；只在触发时写，热路径无额外开销）
         self.last_alert_at: str | None = None
         self.last_alert_type: str | None = None
@@ -270,7 +282,15 @@ class AlertManager:
 
         # JPEG 编码在 executor 线程，base64/JSON/HTTP 由 daemon 线程 fire-and-forget。
         # snapshot 为 None 时仍推送（frame_base64=null），保证无证据帧时不丢告警。
-        if self.webhook and executor is not None:
+        # 命中 vlm.rules 的规则改走大模型复核线程（内部自取 executor/webhook 推送）。
+        if self.webhook and self._vlm_review_enabled(rule_name):
+            threading.Thread(
+                target=self._vlm_review,
+                args=(rule_name, alert_type, alert_objects, snapshot, iso_timestamp),
+                daemon=True,
+                name=f"vlm-review-{self.camera_id}-{alert_type}",
+            ).start()
+        elif self.webhook and executor is not None:
             executor.submit(
                 self._build_and_send,
                 rule_name, alert_type, snapshot, alert_objects, iso_timestamp,
@@ -295,10 +315,67 @@ class AlertManager:
         )
 
     # ------------------------------------------------------------------
+    # VLM 复核（吸烟类告警：连拍四宫格问大模型 yes/no，见 alert/vlm_review.py）
+    # ------------------------------------------------------------------
+    def _vlm_review_enabled(self, rule_name: str) -> bool:
+        return (self.frame_cache is not None
+                and rule_name in (self.vlm.get("rules") or ()))
+
+    def _vlm_review(self, rule_name: str, alert_type: str, alert_objects: list[ObjectMeta],
+                    snapshot, iso_timestamp: str):
+        """独立 daemon 线程：触发时刻后采 4 张连拍人像 → 宫格图问大模型 → 按判定推送。
+
+        连拍等待（≤ deadline）与 VLM HTTP 全部阻塞在本线程，不占检测/executor 线程。
+        shadow=true（灰度观察）：任何判定都照常推送且 payload 不附 vlm 字段，结论只进日志；
+        shadow=false：判定 no → 丢弃；yes 或（fail_open 时）不可用 → 走 _build_and_send
+        正常推送，payload 附 vlm 字段（verdict/model/frames）供下游审计。
+        """
+        vlm = self.vlm or {}
+        shadow = bool(vlm.get("shadow", False))
+        best = max(alert_objects, key=lambda o: o.confidence)
+        crops, verdict = [], None
+        t0 = t_sample = time.monotonic()
+        try:
+            crops = vlm_review.collect_frames(
+                self.frame_cache, self.source_id, best.bbox,
+                frames=int(vlm.get("frames", 4)),
+                sample_s=float(vlm.get("sample_ms", 120)) / 1000.0,
+                deadline_s=float(vlm.get("deadline_ms", 1500)) / 1000.0,
+                pad=float(vlm.get("pad", 0.15)),
+            )
+            t_sample = time.monotonic()
+            if crops:
+                verdict = vlm_review.ask(
+                    vlm.get("url", ""), vlm.get("model", ""),
+                    vlm_review.build_grid(crops),
+                    vlm.get("prompt", vlm_review.PROMPT),
+                    timeout=float(vlm.get("timeout", 5)),
+                )
+        except Exception:
+            logger.exception("vlm-review 流程异常 camera={}", self.camera_id)
+        # 全链路延迟：小模型告警触发（本线程启动）→ 连拍采样 → 大模型判定返回
+        t_end = time.monotonic()
+        logger.info("vlm-review camera={} rule={} verdict={} frames={} "
+                    "sample={}ms infer={}ms total={}ms",
+                    self.camera_name, alert_type, verdict or "skipped", len(crops),
+                    round((t_sample - t0) * 1000), round((t_end - t_sample) * 1000),
+                    round((t_end - t0) * 1000))
+        review = {"verdict": verdict or "skipped", "model": vlm.get("model"),
+                  "frames": len(crops)}
+        if not shadow and (verdict == "no"
+                           or (verdict is None and not vlm.get("fail_open", True))):
+            logger.info("vlm-review camera={} rule={} verdict={} → 丢弃",
+                        self.camera_name, alert_type, review["verdict"])
+            return
+        self._build_and_send(rule_name, alert_type, snapshot, alert_objects,
+                             iso_timestamp, review=None if shadow else review)
+
+    # ------------------------------------------------------------------
     # 后台线程：JPEG 编码（executor）→ fire-and-forget 推送（daemon）
     # ------------------------------------------------------------------
     def _build_and_send(self, rule_name: str, alert_type: str, snapshot,
-                        alert_objects: list[ObjectMeta], iso_timestamp: str):
+                        alert_objects: list[ObjectMeta], iso_timestamp: str,
+                        review: dict | None = None):
         """JPEG 编码在 executor 线程执行（C 扩展，释放 GIL）。
 
         snapshot 是**未经 OSD 的原始帧**（证据支路挂在 nvdsosd 之前）；违规 red 框 +
@@ -323,7 +400,7 @@ class AlertManager:
             # 3. Fire-and-forget: base64 → JSON → HTTP 全部在独立 daemon 线程
             threading.Thread(
                 target=self._send_payload,
-                args=(rule_name, alert_type, buffer, alert_objects, iso_timestamp),
+                args=(rule_name, alert_type, buffer, alert_objects, iso_timestamp, review),
                 daemon=True,
                 name=f"webhook-send-{self.camera_id}-{alert_type}",
             ).start()
@@ -373,7 +450,8 @@ class AlertManager:
         return frame
 
     def _send_payload(self, rule_name: str, alert_type: str, buffer: bytes | None,
-                      alert_objects: list[ObjectMeta], iso_timestamp: str):
+                      alert_objects: list[ObjectMeta], iso_timestamp: str,
+                      review: dict | None = None):
         """Fire-and-forget: base64 → JSON → HTTP POST。独立 daemon 线程。
 
         GIL 密集操作（base64、json.dumps）和阻塞 I/O（HTTP）均在此线程完成，
@@ -424,6 +502,9 @@ class AlertManager:
                 "objects": objects_payload,
                 "frame_base64": frame_base64,
             }
+            if review is not None:
+                # VLM 复核结论（verdict/model/frames），下游可按需审计或展示
+                payload["vlm"] = review
 
             # 3. HTTP POST（阻塞 I/O，释放 GIL）
             self.webhook.send(payload)
