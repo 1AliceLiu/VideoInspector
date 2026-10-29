@@ -1,4 +1,4 @@
-"""VLM 吸烟复核单测：连拍采样、四宫格拼接、yes/no 门控、fail_open、shadow 观察模式。
+"""VLM 复核单测：连拍采样、四宫格拼接、多规则 yes/no 门控（含极性）、shadow、fail_open。
 
 不依赖 DeepStream/GPU：帧缓存用假对象（bgr() 返回 numpy），大模型用本机临时
 HTTP 服务模拟 OpenAI 兼容 /v1/chat/completions。需要 cv2/numpy/simplejpeg，
@@ -25,7 +25,7 @@ from server.alert.manager import AlertManager
 from server.alert.rules import parse_rules
 from server.metadata import AttributeMeta, ObjectMeta
 
-VLM_BASE = {"enabled": True, "rules": ["smoking"], "frames": 4,
+VLM_BASE = {"enabled": True, "rules": ["smoking"],
             "sample_ms": 0, "deadline_ms": 500, "timeout": 5}
 OBJ = ObjectMeta("person", 0.9, (300, 100, 420, 500),
                  (AttributeMeta("smoking", 0.6),))
@@ -106,8 +106,8 @@ class TestVlmReview(unittest.TestCase):
             time.sleep(0.01)
         return None
 
-    def _review(self, m):
-        m._vlm_review("smoking", "smoking", [OBJ], self.snapshot(), "2026-01-01T00:00:00+00:00")
+    def _review(self, m, rule="smoking"):
+        m._vlm_review(rule, rule, [OBJ], self.snapshot(), "2026-01-01T00:00:00+00:00")
 
     def test_yes_sends_with_verdict(self):
         srv, url = _serve_answer("Yes")
@@ -127,6 +127,43 @@ class TestVlmReview(unittest.TestCase):
         self._review(m)
         time.sleep(0.2)
         self.assertEqual(wh.payloads, [])
+
+    # --- 多规则：安全帽/反光衣问"是否佩戴"，答 no=违规坐实（极性与吸烟相反）---
+    def test_helmet_no_pushes_with_verdict(self):
+        srv, url = _serve_answer("No")   # 没戴帽 → 违规坐实 → 推
+        self.addCleanup(srv.shutdown)
+        m, wh = _manager(url, rules=["no_helmet"])
+        self._review(m, "no_helmet")
+        p = self._wait_payload(wh)
+        self.assertIsNotNone(p)
+        self.assertEqual(p["vlm"]["verdict"], "no")   # 下游看原始 verdict，语义由 rule 定
+        self.assertEqual(p["vlm"]["frames"], 1)      # 静态属性单帧，不等连拍
+
+    def test_helmet_yes_discards(self):
+        srv, url = _serve_answer("Yes")  # 戴了帽 → 误报 → 拦
+        self.addCleanup(srv.shutdown)
+        m, wh = _manager(url, rules=["no_helmet"])
+        self._review(m, "no_helmet")
+        time.sleep(0.2)
+        self.assertEqual(wh.payloads, [])
+
+    def test_vest_yes_discards(self):
+        srv, url = _serve_answer("Yes")  # 穿了反光衣 → 误报 → 拦
+        self.addCleanup(srv.shutdown)
+        m, wh = _manager(url, rules=["no_vest"])
+        self._review(m, "no_vest")
+        time.sleep(0.2)
+        self.assertEqual(wh.payloads, [])
+
+    def test_unreviewed_rule_pushes_directly(self):
+        # 规则在 vlm.rules 内但 REVIEWS 未定义 → 直接推送并记 warning（不误拦）
+        srv, url = _serve_answer("No")
+        self.addCleanup(srv.shutdown)
+        m, wh = _manager(url, rules=["no_harness"])
+        self._review(m, "no_harness")
+        p = self._wait_payload(wh)
+        self.assertIsNotNone(p)
+        self.assertNotIn("vlm", p)
 
     def test_shadow_no_pushes_without_field(self):
         # 观察模式：verdict=no 不拦告警，payload 也不附 vlm 字段（主程序输出不变）

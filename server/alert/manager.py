@@ -315,7 +315,7 @@ class AlertManager:
         )
 
     # ------------------------------------------------------------------
-    # VLM 复核（吸烟类告警：连拍四宫格问大模型 yes/no，见 alert/vlm_review.py）
+    # VLM 复核（告警二次确认：连拍四宫格问大模型 yes/no，见 alert/vlm_review.py）
     # ------------------------------------------------------------------
     def _vlm_review_enabled(self, rule_name: str) -> bool:
         return (self.frame_cache is not None
@@ -323,22 +323,31 @@ class AlertManager:
 
     def _vlm_review(self, rule_name: str, alert_type: str, alert_objects: list[ObjectMeta],
                     snapshot, iso_timestamp: str):
-        """独立 daemon 线程：触发时刻后采 4 张连拍人像 → 宫格图问大模型 → 按判定推送。
+        """独立 daemon 线程：触发时刻后按规则采连拍人像（吸烟4帧/防护1帧）→ 问大模型 → 按判定推送。
 
-        连拍等待（≤ deadline）与 VLM HTTP 全部阻塞在本线程，不占检测/executor 线程。
+        采样等待（≤ deadline）与 VLM HTTP 全部阻塞在本线程，不占检测/executor 线程。
+        每规则的问题与违规确认方向见 vlm_review.REVIEWS（吸烟答 yes=违规；安全帽/
+        反光衣答 no=违规——问的是"有没有佩戴"，极性相反）。
         shadow=true（灰度观察）：任何判定都照常推送且 payload 不附 vlm 字段，结论只进日志；
-        shadow=false：判定 no → 丢弃；yes 或（fail_open 时）不可用 → 走 _build_and_send
-        正常推送，payload 附 vlm 字段（verdict/model/frames）供下游审计。
+        shadow=false：判定与违规方向相反 → 丢弃；坐实违规或（fail_open 时）不可用 →
+        走 _build_and_send 正常推送，payload 附 vlm 字段（verdict/model/frames）供下游审计。
         """
         vlm = self.vlm or {}
         shadow = bool(vlm.get("shadow", False))
+        rv = vlm_review.REVIEWS.get(rule_name)
+        if rv is None:   # 问不对问题不如不问：未定义复核问题的规则直推
+            logger.warning("vlm-review 规则={} 未在 REVIEWS 定义，直接推送", rule_name)
+            self._build_and_send(rule_name, alert_type, snapshot, alert_objects,
+                                 iso_timestamp)
+            return
+        prompt, expect, nframes = rv
         best = max(alert_objects, key=lambda o: o.confidence)
         crops, verdict = [], None
         t0 = t_sample = time.monotonic()
         try:
             crops = vlm_review.collect_frames(
                 self.frame_cache, self.source_id, best.bbox,
-                frames=int(vlm.get("frames", 4)),
+                frames=nframes,
                 sample_s=float(vlm.get("sample_ms", 120)) / 1000.0,
                 deadline_s=float(vlm.get("deadline_ms", 1500)) / 1000.0,
                 pad=float(vlm.get("pad", 0.15)),
@@ -348,7 +357,7 @@ class AlertManager:
                 verdict = vlm_review.ask(
                     vlm.get("url", ""), vlm.get("model", ""),
                     vlm_review.build_grid(crops),
-                    vlm.get("prompt", vlm_review.PROMPT),
+                    prompt,
                     timeout=float(vlm.get("timeout", 5)),
                 )
         except Exception:
@@ -362,7 +371,7 @@ class AlertManager:
                     round((t_end - t0) * 1000))
         review = {"verdict": verdict or "skipped", "model": vlm.get("model"),
                   "frames": len(crops)}
-        if not shadow and (verdict == "no"
+        if not shadow and ((verdict is not None and verdict != expect)
                            or (verdict is None and not vlm.get("fail_open", True))):
             logger.info("vlm-review camera={} rule={} verdict={} → 丢弃",
                         self.camera_name, alert_type, review["verdict"])

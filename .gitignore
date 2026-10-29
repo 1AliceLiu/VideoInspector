@@ -28,4 +28,4 @@ package/logs/*
 deploy/runtime/
 
 *.jpg
-
+*.csv

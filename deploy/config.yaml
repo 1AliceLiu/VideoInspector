@@ -145,10 +145,10 @@ vlm:
   shadow: true
   url: http://vllm:8013/v1/chat/completions
   model: /model/Qwen2.5-VL-7B-Instruct-AWQ
-  rules: [smoking]
-  frames: 4
-  sample_ms: 120
+  rules: [smoking, no_helmet, no_vest]   # 复核问题与确认极性见 server/alert/vlm_review.py REVIEWS
+  sample_ms: 120                       # 吸烟连拍帧间隔（安全帽/反光衣 1 帧，无采样等待）
   deadline_ms: 1500
+  timeout: 2                           # 单次复核 HTTP 上限（infer 实测 p95≈250ms，足够宽裕）
   pad: 0.15
   fail_open: true
 

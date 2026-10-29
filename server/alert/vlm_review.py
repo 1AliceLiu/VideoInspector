@@ -1,18 +1,20 @@
-"""吸烟告警的视觉大模型二级复核：连续 4 帧人像裁剪 → 2×2 宫格图 → yes/no。
+"""告警的视觉大模型二级复核：连续 4 帧人像裁剪 → 2×2 宫格图 → yes/no。
 
-定位（配置见 deploy/config.yaml vlm 节）：smoke 小模型仍走既有 DeepStream 链实时初筛；
+定位（配置见 deploy/config.yaml vlm 节）：小模型仍走既有 DeepStream 链实时初筛；
 状态机触发告警后**不直接推 webhook**，本模块在证据帧缓存里轮询触发后的新帧（采样与
 HTTP 全在告警 daemon 线程，不碰检测流线程），按触发时刻的 person bbox 裁剪连拍人像，
 拼成 2×2 宫格图（一次调用覆盖 ~0.5s 连拍，固定开销只付一遍），问 OpenAI 兼容接口
-（如 vLLM 部署的 Qwen2.5-VL，max_tokens=1）「此人是否在吸烟」。
+（如 vLLM 部署的 Qwen2.5-VL，max_tokens=1）。每规则的复核问题与违规确认方向见 REVIEWS。
 
 判定语义（shadow=true 观察模式下不拦告警、payload 不附字段，结论只进日志）：
-  yes        → 正常推送（payload 附 vlm.verdict=yes）
-  no         → 丢弃，仅记日志
+  verdict == 确认方向 → 正常推送（payload 附 vlm.verdict）
+  verdict == 相反方向 → 丢弃（误报被大模型排除），仅记日志
   不可用/无帧 → fail_open（默认 true）照常推送，verdict=skipped —— 宁误报不漏报
 
-配置键 deploy/config.yaml vlm 节：enabled/shadow/url/model/rules/frames/sample_ms/
-deadline_ms/pad（bbox 外扩比例，默认 0.15）/fail_open/timeout/prompt，见 manager.py _vlm_review。
+配置键 deploy/config.yaml vlm 节：enabled/shadow/url/model/rules/
+sample_ms/deadline_ms/pad（bbox 外扩比例，默认 0.15）/fail_open/timeout；
+每规则的问题/确认方向/连拍帧数在 REVIEWS（吸烟 4 帧，安全帽/反光衣 1 帧）。
+rules 只支持 REVIEWS 中的键名，未定义的规则直接推送并告警（问不对问题不如不问）。
 """
 
 import base64
@@ -27,10 +29,21 @@ from loguru import logger
 
 TILE = 256  # 宫格单格边长 px：4 格拼 512×512，视觉 token 少，单张 L20 一次调用 ~0.1s
 
-PROMPT = (
-    "这 4 张图是同一个人连续的 4 张裁剪连拍（左上、右上、左下、右下）。"
-    "此人是否在吸烟（手持香烟或口含香烟，无论是否点燃）？只回答一个词：yes 或 no。"
-)
+PRE = "这 4 张图是同一个人连续的 4 张裁剪连拍（左上、右上、左下、右下）。"
+TAIL = "只回答一个词：yes 或 no。"
+
+PROMPT = PRE + "此人是否在吸烟（手持香烟或口含香烟，无论是否点燃）？" + TAIL
+# 安全帽/反光衣是静态属性，一帧即可判，无需连拍（省 ~0.5s 采样等待）：
+HELMET_PROMPT = "下图是一名工人的裁剪图像。此人头上是否佩戴了安全帽？" + TAIL
+VEST_PROMPT = "下图是一名工人的裁剪图像。此人是否穿着香港工程反光衣（高可视反光背心）？" + TAIL
+
+# 规则 → (复核问题, 违规确认答案, 连拍帧数)。注意极性：吸烟"在吸"即违规(yes)；
+# 安全帽/反光衣"佩戴/穿着"是合规，答 no 才是违规坐实。
+REVIEWS = {
+    "smoking": (PROMPT, "yes", 4),
+    "no_helmet": (HELMET_PROMPT, "no", 1),
+    "no_vest": (VEST_PROMPT, "no", 1),
+}
 
 
 def crop_person(frame: np.ndarray, bbox, out: int = TILE, pad: float = 0.15):
@@ -49,7 +62,9 @@ def crop_person(frame: np.ndarray, bbox, out: int = TILE, pad: float = 0.15):
 
 
 def build_grid(crops: list) -> bytes:
-    """≤4 张裁剪拼 2×2 宫格 JPEG；不足 4 张用最后一张补齐（大模型视角=一次连拍）。"""
+    """单帧直通；≤4 张裁剪拼 2×2 宫格 JPEG（不足 4 张用最后一张补齐）。"""
+    if len(crops) == 1:
+        return simplejpeg.encode_jpeg(crops[0], quality=90, colorspace="BGR")
     tiles = crops[:4]
     filler = tiles[-1] if tiles else np.zeros((TILE, TILE, 3), np.uint8)
     while len(tiles) < 4:
@@ -75,6 +90,8 @@ def collect_frames(frame_cache, source_id, bbox,
             crop = crop_person(entry[0].bgr(), bbox, pad=pad)
             if crop is not None:
                 crops.append(crop)
+                if len(crops) >= frames:
+                    break          # 采满立刻走，不空等最后一个 sleep（单帧规则 0 等待）
         time.sleep(sample_s)
     return crops
 
