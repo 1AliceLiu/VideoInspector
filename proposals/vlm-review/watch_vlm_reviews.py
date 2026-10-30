@@ -47,13 +47,13 @@ LINE_RE = re.compile(
     r"sample=(?P<sample>\d+)ms infer=(?P<infer>\d+)ms total=(?P<total>\d+)ms"
 )
 
-EXPECT = {"smoking": "yes"}   # 其余规则问"是否佩戴/穿着"→ 答 no=违规坐实（与 vlm_review.REVIEWS 同步）
+EXPECT = {}   # 两问合一后三规则极性统一 yes=违规坐实（与 vlm_review.REVIEWS 同步）
 
 
 def mark(rule: str, verdict: str) -> str:
     if verdict == "skipped":
         return "∅跳"
-    return "✓确认" if verdict == EXPECT.get(rule, "no") else "✗排除"
+    return "✓确认" if verdict == EXPECT.get(rule, "yes") else "✗排除"
 
 
 def fmt(camera: str, rule: str, verdict: str, frames: str, sample: str,
