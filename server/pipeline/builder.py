@@ -100,6 +100,12 @@ class PipelineBuilder:
 
         executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="webhook")
         self.alert_managers = self._build_alert_managers(cfg, executor, logger, frame_cache)
+        vlm_cfg = cfg.get("vlm") or {}
+        if vlm_cfg.get("enabled") and vlm_cfg.get("audit"):
+            from server.alert import vlm_audit   # 空闲期 GPU 巡检，默认关闭
+            vlm_audit.start(frame_cache, self.alert_managers, vlm_cfg)
+            logger.info("vlm-audit 巡检已启用 interval={}s cameras={}",
+                        vlm_cfg.get("audit_interval_s", 90), len(self.alert_managers))
 
         # 区域标定期排障日志：仅当「本部署真的配了区域」且显式开了 log.out_of_zone
         # 才逐帧记录「违规成立但在区域外被淘汰」——现场用来区分「模型没检出」与

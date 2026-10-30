@@ -82,6 +82,53 @@ def _serve_answer(answer: str):
     return server, f"http://127.0.0.1:{server.server_port}/v1/chat/completions"
 
 
+def _serve_map(mapping: dict, default: str = "yes"):
+    """按 prompt 关键词路由答案的假服务（v3 一次复核问多个问题）。"""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            text = json.loads(raw)["messages"][0]["content"][0]["text"]
+            ans = next((v for k, v in mapping.items() if k in text), default)
+            body = json.dumps({"choices": [{"message": {"content": ans}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_port}/v1/chat/completions"
+
+
+def _serve_seq(seq: list):
+    """按调用顺序依次吐答案的假服务（多人逐人复核用例）。"""
+    state = {"i": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            ans = seq[min(state["i"], len(seq) - 1)]
+            state["i"] += 1
+            body = json.dumps({"choices": [{"message": {"content": ans}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_port}/v1/chat/completions"
+
+
 def _manager(url: str, **vlm_extra):
     rules = parse_rules({"smoking": {"gie": "smoke", "cooldown_seconds": 30,
                                      "min_detection_count": 3,
@@ -128,32 +175,56 @@ class TestVlmReview(unittest.TestCase):
         time.sleep(0.2)
         self.assertEqual(wh.payloads, [])
 
-    # --- 多规则：安全帽/反光衣问"是否佩戴"，答 no=违规坐实（极性与吸烟相反）---
-    def test_helmet_no_pushes_with_verdict(self):
-        srv, url = _serve_answer("No")   # 没戴帽 → 违规坐实 → 推
+    # --- v3 部件问句：全图红框判人 + 头/躯干特写判穿戴，违规判定在代码侧 ---
+    def test_helmet_violation_pushes_with_persons(self):
+        srv, url = _serve_map({"红框": "yes", "头肩": "no"})   # 真人且没戴帽 → 坐实 → 推
         self.addCleanup(srv.shutdown)
         m, wh = _manager(url, rules=["no_helmet"])
         self._review(m, "no_helmet")
         p = self._wait_payload(wh)
         self.assertIsNotNone(p)
-        self.assertEqual(p["vlm"]["verdict"], "no")   # 下游看原始 verdict，语义由 rule 定
-        self.assertEqual(p["vlm"]["frames"], 1)      # 静态属性单帧，不等连拍
+        self.assertEqual(p["vlm"]["verdict"], "yes")
+        self.assertEqual(len(p["vlm"]["persons"]), 1)
+        self.assertTrue(p["vlm"]["persons"][0]["violated"])
 
-    def test_helmet_yes_discards(self):
-        srv, url = _serve_answer("Yes")  # 戴了帽 → 误报 → 拦
+    def test_helmet_wearing_discards(self):
+        srv, url = _serve_map({"红框": "yes", "头肩": "yes"})  # 戴了帽 → 排除
         self.addCleanup(srv.shutdown)
         m, wh = _manager(url, rules=["no_helmet"])
         self._review(m, "no_helmet")
         time.sleep(0.2)
         self.assertEqual(wh.payloads, [])
 
-    def test_vest_yes_discards(self):
-        srv, url = _serve_answer("Yes")  # 穿了反光衣 → 误报 → 拦
+    def test_helmet_not_person_discards(self):
+        srv, url = _serve_map({"红框": "no"})                 # 护栏假框 → 排除
+        self.addCleanup(srv.shutdown)
+        m, wh = _manager(url, rules=["no_helmet"])
+        self._review(m, "no_helmet")
+        time.sleep(0.2)
+        self.assertEqual(wh.payloads, [])
+
+    def test_vest_wearing_discards(self):
+        srv, url = _serve_map({"红框": "yes", "躯干": "yes"})  # 穿了 → 排除
         self.addCleanup(srv.shutdown)
         m, wh = _manager(url, rules=["no_vest"])
         self._review(m, "no_vest")
         time.sleep(0.2)
         self.assertEqual(wh.payloads, [])
+
+    def test_multi_person_any_violation_pushes(self):
+        # 两人：1号戴帽(合规)、2号没戴(违规) → 整体坐实，payload 带两人明细
+        srv, url = _serve_seq(["yes", "yes", "yes", "no"])
+        self.addCleanup(srv.shutdown)
+        m, wh = _manager(url, rules=["no_helmet"])
+        o2 = ObjectMeta("person", 0.8, (500, 120, 620, 520),
+                        (AttributeMeta("smoking", 0.6),))
+        m._vlm_review("no_helmet", "no_helmet", [OBJ, o2],
+                      self.snapshot(), "2026-01-01T00:00:00+00:00")
+        p = self._wait_payload(wh)
+        self.assertIsNotNone(p)
+        self.assertEqual(p["vlm"]["verdict"], "yes")
+        self.assertEqual(len(p["vlm"]["persons"]), 2)
+        self.assertEqual([q["violated"] for q in p["vlm"]["persons"]], [False, True])
 
     def test_unreviewed_rule_pushes_directly(self):
         # 规则在 vlm.rules 内但 REVIEWS 未定义 → 直接推送并记 warning（不误拦）
@@ -196,9 +267,10 @@ class TestVlmReview(unittest.TestCase):
         arr = vlm_review.simplejpeg.decode_jpeg(vlm_review.build_grid(crops),
                                                 colorspace="BGR")
         self.assertEqual(arr.shape, (vlm_review.TILE * 2, vlm_review.TILE * 2, 3))
-        # 四格采样值互不相同（证明取的是 4 张不同帧而非重复帧）
-        corners = {int(arr[10, 10, 0]), int(arr[10, 500, 0]),
-                   int(arr[500, 10, 0]), int(arr[500, 500, 0])}
+        # 四格采样值互不相同（证明取的是 4 张不同帧而非重复帧）。
+        # 等比 letterbox 后内容贴各格左上角，采样点取每格左上 (10,10) 处。
+        corners = {int(arr[10, 10, 0]), int(arr[10, 266, 0]),
+                   int(arr[266, 10, 0]), int(arr[266, 266, 0])}
         self.assertEqual(len(corners), 4)
 
 

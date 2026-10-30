@@ -195,6 +195,8 @@ class AlertManager:
         # 最近一次告警（供控制面状态查询；只在触发时写，热路径无额外开销）
         self.last_alert_at: str | None = None
         self.last_alert_type: str | None = None
+        # 本帧检测器上报的全部目标（vlm-audit 巡检比对用；每帧一次赋值，开销可忽略）
+        self.last_objects: list[ObjectMeta] = []
 
         # 每条规则一个独立状态机（rule_name → 状态机实例）：
         #   violation 型（PPE 类）→ _RuleState（连续帧确认 + 冷却）
@@ -210,6 +212,7 @@ class AlertManager:
     # ------------------------------------------------------------------
     def handle(self, objects: list[ObjectMeta],
                snapshot=None, executor=None, frame_info=None) -> bool:
+        self.last_objects = objects
         """
         处理一帧的检测结果，按规则独立判定是否触发告警。
 
@@ -326,51 +329,71 @@ class AlertManager:
         """独立 daemon 线程：触发时刻后按规则采连拍人像（吸烟4帧/防护1帧）→ 问大模型 → 按判定推送。
 
         采样等待（≤ deadline）与 VLM HTTP 全部阻塞在本线程，不占检测/executor 线程。
-        每规则的问题与违规确认方向见 vlm_review.REVIEWS（吸烟答 yes=违规；安全帽/
-        反光衣答 no=违规——问的是"有没有佩戴"，极性相反）。
+        每规则的问题/确认方向/帧数见 vlm_review.REVIEWS。两问合一步骤后三条规则极性统一：
+        大模型答 yes = 违规坐实；答 no（含"非真实人员"）= 排除。
         shadow=true（灰度观察）：任何判定都照常推送且 payload 不附 vlm 字段，结论只进日志；
         shadow=false：判定与违规方向相反 → 丢弃；坐实违规或（fail_open 时）不可用 →
         走 _build_and_send 正常推送，payload 附 vlm 字段（verdict/model/frames）供下游审计。
         """
         vlm = self.vlm or {}
         shadow = bool(vlm.get("shadow", False))
-        rv = vlm_review.REVIEWS.get(rule_name)
-        if rv is None:   # 问不对问题不如不问：未定义复核问题的规则直推
-            logger.warning("vlm-review 规则={} 未在 REVIEWS 定义，直接推送", rule_name)
+        mode = vlm_review.RULE_MODE.get(rule_name)
+        if mode is None:   # 问不对问题不如不问：未定义复核方式的规则直推
+            logger.warning("vlm-review 规则={} 未在 RULE_MODE 定义，直接推送", rule_name)
             self._build_and_send(rule_name, alert_type, snapshot, alert_objects,
                                  iso_timestamp)
             return
-        prompt, expect, nframes = rv
-        best = max(alert_objects, key=lambda o: o.confidence)
-        crops, verdict = [], None
+        kind, expect, nframes = mode
+        url, model = vlm.get("url", ""), vlm.get("model", "")
+        timeout = float(vlm.get("timeout", 5))
+        persons, crops, verdict = [], [], None
         t0 = t_sample = time.monotonic()
         try:
-            crops = vlm_review.collect_frames(
-                self.frame_cache, self.source_id, best.bbox,
-                frames=nframes,
-                sample_s=float(vlm.get("sample_ms", 120)) / 1000.0,
-                deadline_s=float(vlm.get("deadline_ms", 1500)) / 1000.0,
-                pad=float(vlm.get("pad", 0.15)),
-            )
-            t_sample = time.monotonic()
-            if crops:
-                verdict = vlm_review.ask(
-                    vlm.get("url", ""), vlm.get("model", ""),
-                    vlm_review.build_grid(crops),
-                    prompt,
-                    timeout=float(vlm.get("timeout", 5)),
+            if kind == "burst":        # 吸烟：连拍宫格单问（极性天然简单，垃圾框答 no 自排除）
+                best = max(alert_objects, key=lambda o: o.confidence)
+                crops = vlm_review.collect_frames(
+                    self.frame_cache, self.source_id, best.bbox,
+                    frames=nframes,
+                    sample_s=float(vlm.get("sample_ms", 120)) / 1000.0,
+                    deadline_s=float(vlm.get("deadline_ms", 1500)) / 1000.0,
+                    pad=float(vlm.get("pad", 0.15)),
                 )
+                t_sample = time.monotonic()
+                if crops:
+                    verdict = vlm_review.ask(url, model, vlm_review.build_grid(crops),
+                                             vlm_review.PROMPT, timeout)
+            else:                      # PPE：逐人复核（一图多人全进名单），全图红框判人+部位特写判穿戴
+                frame = snapshot if isinstance(snapshot, np.ndarray) else None
+                if frame is None:
+                    ef = self.frame_cache.latest(self.source_id)
+                    frame = ef.bgr() if ef is not None else None
+                if frame is not None:
+                    for obj in sorted(alert_objects, key=lambda o: -o.confidence)[:4]:
+                        person, wearing, violated, ms = vlm_review.judge_ppe(
+                            url, model, frame, obj.bbox, rule_name, timeout)
+                        persons.append({"conf": round(obj.confidence, 2),
+                                        "person": person, "wearing": wearing,
+                                        "violated": violated, "ms": ms})
+                t_sample = time.monotonic()
+                asked = [p for p in persons
+                         if p["person"] is not None and p["wearing"] is not None]
+                if asked:
+                    verdict = "yes" if any(p["violated"] for p in asked) else "no"
+                # asked 为空 = 大模型全程不可用 → verdict 保持 None → 走 fail_open
         except Exception:
             logger.exception("vlm-review 流程异常 camera={}", self.camera_id)
-        # 全链路延迟：小模型告警触发（本线程启动）→ 连拍采样 → 大模型判定返回
+        # 全链路延迟：小模型告警触发（本线程启动）→ 采样/判问 → 大模型判定返回
         t_end = time.monotonic()
         logger.info("vlm-review camera={} rule={} verdict={} frames={} "
-                    "sample={}ms infer={}ms total={}ms",
-                    self.camera_name, alert_type, verdict or "skipped", len(crops),
+                    "sample={}ms infer={}ms total={}ms persons={}",
+                    self.camera_name, alert_type, verdict or "skipped",
+                    len(crops) or len(persons),
                     round((t_sample - t0) * 1000), round((t_end - t_sample) * 1000),
-                    round((t_end - t0) * 1000))
-        review = {"verdict": verdict or "skipped", "model": vlm.get("model"),
-                  "frames": len(crops)}
+                    round((t_end - t0) * 1000), len(persons))
+        review = {"verdict": verdict or "skipped", "model": model,
+                  "frames": len(crops) or len(persons)}
+        if persons:
+            review["persons"] = persons
         if not shadow and ((verdict is not None and verdict != expect)
                            or (verdict is None and not vlm.get("fail_open", True))):
             logger.info("vlm-review camera={} rule={} verdict={} → 丢弃",
