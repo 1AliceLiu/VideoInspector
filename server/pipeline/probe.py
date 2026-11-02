@@ -182,10 +182,23 @@ class SafetyProbe(BatchMetadataOperator):
 
             # 第二趟: 每个 person → ObjectMeta（违规进 attributes）+ 渲染决策
             objects: list[ObjectMeta] = []
+            low_conf: list[ObjectMeta] = []   # 0.25~业务门：交给 vlm-audit 低置信巡检（只记录，不渲染不告警）
             for obj in frame_meta.object_items:
                 if obj.unique_component_id != self._person_uid:
                     continue
                 if obj.confidence < self._person_conf_threshold:
+                    if obj.confidence >= 0.25:    # pgie 引擎门 0.25 以上的框才存在
+                        low_conf.append(ObjectMeta(
+                            class_name="person",
+                            confidence=obj.confidence,
+                            bbox=(
+                                int(obj.rect_params.left),
+                                int(obj.rect_params.top),
+                                int(obj.rect_params.left + obj.rect_params.width),
+                                int(obj.rect_params.top + obj.rect_params.height),
+                            ),
+                            attributes=(),
+                        ))
                     obj.rect_params.border_width = _HIDE_BOX  # 噪声框/字也须显式隐藏
                     obj.text_params.display_text = _HIDE_TEXT
                     continue
@@ -275,6 +288,7 @@ class SafetyProbe(BatchMetadataOperator):
                         )
                 manager.handle(objects, snapshot=snapshot,
                                executor=self._executor, frame_info=frame_info)
+                manager.note_low_conf(low_conf)
             elif objects:
                 logger.debug("source_id={} 无对应 AlertManager，跳过告警判定", source_id)
 

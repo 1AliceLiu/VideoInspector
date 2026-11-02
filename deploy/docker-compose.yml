@@ -30,6 +30,7 @@ services:
       - ./models:/app/deploy/models:ro
       - ./generated:/app/deploy/generated
       - ./logs:/app/deploy/logs
+      - ../temp2:/app/temp2                # 巡检命中证据图落盘（vlm.audit_dump_dir）
 
     ports:
       - "18003:8554/tcp"

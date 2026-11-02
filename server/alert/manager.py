@@ -197,6 +197,8 @@ class AlertManager:
         self.last_alert_type: str | None = None
         # 本帧检测器上报的全部目标（vlm-audit 巡检比对用；每帧一次赋值，开销可忽略）
         self.last_objects: list[ObjectMeta] = []
+        # 本帧 0.25~业务门 的低置信 person 框（vlm-audit 低置信巡检消费）
+        self.last_low_objects: list[ObjectMeta] = []
 
         # 每条规则一个独立状态机（rule_name → 状态机实例）：
         #   violation 型（PPE 类）→ _RuleState（连续帧确认 + 冷却）
@@ -207,12 +209,15 @@ class AlertManager:
             for rule in rules
         }
 
+    def note_low_conf(self, objects: list[ObjectMeta]):
+        """记录本帧低置信 person 框；巡检线程按周期取用（不渲染、不告警）。"""
+        self.last_low_objects = objects
+
     # ------------------------------------------------------------------
     # 主入口：每帧调用（检测线程，仅做决策，不做图片）
     # ------------------------------------------------------------------
     def handle(self, objects: list[ObjectMeta],
                snapshot=None, executor=None, frame_info=None) -> bool:
-        self.last_objects = objects
         """
         处理一帧的检测结果，按规则独立判定是否触发告警。
 
@@ -229,6 +234,7 @@ class AlertManager:
         Returns:
             True 表示本帧至少触发了一条规则
         """
+        self.last_objects = objects
         triggered = False
         for rule_name, state in self._rule_states.items():
             alert_type = state.rule.alert_type or rule_name
@@ -329,8 +335,7 @@ class AlertManager:
         """独立 daemon 线程：触发时刻后按规则采连拍人像（吸烟4帧/防护1帧）→ 问大模型 → 按判定推送。
 
         采样等待（≤ deadline）与 VLM HTTP 全部阻塞在本线程，不占检测/executor 线程。
-        每规则的问题/确认方向/帧数见 vlm_review.REVIEWS。两问合一步骤后三条规则极性统一：
-        大模型答 yes = 违规坐实；答 no（含"非真实人员"）= 排除。
+        每规则的问题/确认方向/帧数见 vlm_review.RULE_MODE（PPE 用部件问句，吸烟用连拍宫格）。
         shadow=true（灰度观察）：任何判定都照常推送且 payload 不附 vlm 字段，结论只进日志；
         shadow=false：判定与违规方向相反 → 丢弃；坐实违规或（fail_open 时）不可用 →
         走 _build_and_send 正常推送，payload 附 vlm 字段（verdict/model/frames）供下游审计。

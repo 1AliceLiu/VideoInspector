@@ -46,8 +46,18 @@ LINE_RE = re.compile(
     r"verdict=(?P<verdict>\w+) frames=(?P<frames>\d+) "
     r"sample=(?P<sample>\d+)ms infer=(?P<infer>\d+)ms total=(?P<total>\d+)ms"
 )
+# 巡检命中行（vlm_audit.py）：... bbox=(x1,y1,x2,y2) → 检测器漏报候选 (图: dir/tag_*.jpg)
+AUDIT_RE = re.compile(
+    r"vlm-audit camera=(?P<camera>.*?) rule=(?P<rule>\w+) "
+    r"person=(?P<person>\w+) wearing=(?P<wearing>\w+) "
+    r"bbox=\((?P<x1>[\d.]+),(?P<y1>[\d.]+),(?P<x2>[\d.]+),(?P<y2>[\d.]+)\)"
+)
+REVIEW_HEADER = ("北京时间", "camera", "rule", "verdict", "结果",
+                 "frames", "sample_ms", "infer_ms", "total_ms")
+AUDIT_HEADER = ("北京时间", "camera", "rule", "person", "wearing",
+                "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "图前缀")
 
-EXPECT = {}   # 两问合一后三规则极性统一 yes=违规坐实（与 vlm_review.REVIEWS 同步）
+EXPECT = {}   # 三规则极性统一 yes=违规坐实（与 vlm_review.RULE_MODE 同步）
 
 
 def mark(rule: str, verdict: str) -> str:
@@ -115,7 +125,7 @@ def iter_new_lines(path: Path, follow: bool):
             time.sleep(1.0)
 
 
-def make_csv(path: str):
+def make_csv(path: str, header: tuple):
     """返回 emit(row) 闭包：追加写 + 行级去重（重跑/重启幂等）；新文件带表头+BOM。"""
     p = Path(path)
     fresh = not p.exists() or p.stat().st_size == 0
@@ -126,8 +136,7 @@ def make_csv(path: str):
     fp = p.open("a", newline="", encoding="utf-8-sig" if fresh else "utf-8")
     w = csv.writer(fp)
     if fresh:
-        w.writerow(("北京时间", "camera", "rule", "verdict", "结果",
-                    "frames", "sample_ms", "infer_ms", "total_ms"))
+        w.writerow(header)
         fp.flush()
 
     def emit(row):
@@ -145,21 +154,29 @@ def main() -> int:
                     default=["deploy/logs/server.log"],
                     help="一个或多个日志文件（.gz 自动解压；shell 通配符展开传入）。跟随模式只用第一个")
     ap.add_argument("--once", action="store_true", help="扫完给定文件出汇总即退出")
-    ap.add_argument("--csv", default=None, help="判定实时追加写入的 CSV 路径（去重幂等）")
+    ap.add_argument("--csv", default=None, help="复核判定实时追加写入的 CSV 路径（去重幂等）")
+    ap.add_argument("--audit-csv", default=None,
+                    help="巡检命中（vlm-audit）实时追加写入的 CSV 路径（去重幂等）")
+    ap.add_argument("--since", default=None,
+                    help='只看该北京时间之后的记录，如 "10-30 10:47"（也接受 10-30_10:47）')
+    ap.add_argument("--audit-since", default=None,
+                    help='巡检记录的独立裁切线（如换方案/清旧数据后设置），格式同 --since')
     args = ap.parse_args()
+    since = (args.since or "").replace("_", " ").strip() or None
+    audit_since = (args.audit_since or "").replace("_", " ").strip() or None
 
     stats = Stats()
-    emit = make_csv(args.csv) if args.csv else None
+    audit_hits = Counter()
+    emit = make_csv(args.csv, REVIEW_HEADER) if args.csv else None
+    emit_audit = make_csv(args.audit_csv, AUDIT_HEADER) if args.audit_csv else None
 
     def handle(raw: bytes):
         try:
             text = json.loads(raw.decode("utf-8", errors="replace"))["text"]
         except Exception:
             return
-        m = LINE_RE.search(text)
-        if m is None:
+        if "vlm-review" not in text and "vlm-audit" not in text:
             return
-        stats.add(m)
         # 日志时间戳是 UTC(+0000)；显示北京时间(+8h，含日期——跨天样本别对错)。
         # 对应证据帧：同摄像头、同秒的 🚨 alert 即本条复核对象（shadow 下都推送了）。
         try:
@@ -167,12 +184,32 @@ def main() -> int:
             ts = dt.strftime("%m-%d %H:%M:%S")
         except Exception:
             ts = ""
-        print(fmt(m["camera"], m["rule"], m["verdict"], m["frames"],
-                  m["sample"], m["infer"], m["total"], ts), flush=True)
-        if emit:
-            emit((ts, m["camera"], m["rule"], m["verdict"],
-                  mark(m["rule"], m["verdict"]), m["frames"],
-                  m["sample"], m["infer"], m["total"]))
+        if since and ts and ts < since:      # 裁切线：旧数据不打印、不计数、不入库
+            return
+        m = LINE_RE.search(text)
+        if m is not None:
+            stats.add(m)
+            print(fmt(m["camera"], m["rule"], m["verdict"], m["frames"],
+                      m["sample"], m["infer"], m["total"], ts), flush=True)
+            if emit:
+                emit((ts, m["camera"], m["rule"], m["verdict"],
+                      mark(m["rule"], m["verdict"]), m["frames"],
+                      m["sample"], m["infer"], m["total"]))
+            return
+        a = AUDIT_RE.search(text)
+        if a is not None:
+            if audit_since and ts and ts < audit_since:
+                return
+            audit_hits[a["rule"]] += 1
+            mi = re.search(r"图: (.*?)_\*\.jpg", text)
+            img = mi[1] if mi else ""
+            print(f"[{ts}] 🚨漏报 camera={a['camera']} rule={a['rule']} "
+                  f"person={a['person']} wearing={a['wearing']} "
+                  f"bbox=({a['x1']},{a['y1']},{a['x2']},{a['y2']}) 图={img}_*.jpg",
+                  flush=True)
+            if emit_audit:
+                emit_audit((ts, a["camera"], a["rule"], a["person"], a["wearing"],
+                            a["x1"], a["y1"], a["x2"], a["y2"], img))
 
     if args.once:
         for pth in args.paths:
@@ -192,6 +229,9 @@ def main() -> int:
 
     print("\n===== 汇总 =====", flush=True)
     print(stats.summary(), flush=True)
+    if audit_hits:
+        print("巡检漏报命中: " + ", ".join(f"{k}={v}" for k, v in audit_hits.items()),
+              flush=True)
     return 0
 
 

@@ -61,6 +61,8 @@ vlm:
 
 ## v3 架构（2026-10-30，考卷驱动）
 
+> **可视化架构文档（含数据流图/时序图/配置开关/回退表）：[`v3-architecture.md`](v3-architecture.md)**
+
 考卷与跑分脚本在 `eval/`（人工标注 56 样本，"?"=人眼也拿不准、不计分）：
 `python3 eval/run_eval.py A|G|E2`（helmet-dev 容器内，需 temp2 图）。
 

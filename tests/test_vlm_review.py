@@ -177,7 +177,7 @@ class TestVlmReview(unittest.TestCase):
 
     # --- v3 部件问句：全图红框判人 + 头/躯干特写判穿戴，违规判定在代码侧 ---
     def test_helmet_violation_pushes_with_persons(self):
-        srv, url = _serve_map({"红框": "yes", "头肩": "no"})   # 真人且没戴帽 → 坐实 → 推
+        srv, url = _serve_map({"red box": "yes", "head and shoulders": "no"})   # 真人且没戴帽 → 坐实 → 推
         self.addCleanup(srv.shutdown)
         m, wh = _manager(url, rules=["no_helmet"])
         self._review(m, "no_helmet")
@@ -188,7 +188,7 @@ class TestVlmReview(unittest.TestCase):
         self.assertTrue(p["vlm"]["persons"][0]["violated"])
 
     def test_helmet_wearing_discards(self):
-        srv, url = _serve_map({"红框": "yes", "头肩": "yes"})  # 戴了帽 → 排除
+        srv, url = _serve_map({"red box": "yes", "head and shoulders": "yes"})  # 戴了帽 → 排除
         self.addCleanup(srv.shutdown)
         m, wh = _manager(url, rules=["no_helmet"])
         self._review(m, "no_helmet")
@@ -196,7 +196,7 @@ class TestVlmReview(unittest.TestCase):
         self.assertEqual(wh.payloads, [])
 
     def test_helmet_not_person_discards(self):
-        srv, url = _serve_map({"红框": "no"})                 # 护栏假框 → 排除
+        srv, url = _serve_map({"red box": "no"})              # 护栏假框 → 排除
         self.addCleanup(srv.shutdown)
         m, wh = _manager(url, rules=["no_helmet"])
         self._review(m, "no_helmet")
@@ -204,7 +204,7 @@ class TestVlmReview(unittest.TestCase):
         self.assertEqual(wh.payloads, [])
 
     def test_vest_wearing_discards(self):
-        srv, url = _serve_map({"红框": "yes", "躯干": "yes"})  # 穿了 → 排除
+        srv, url = _serve_map({"red box": "yes", "torso": "yes"})  # 穿了 → 排除
         self.addCleanup(srv.shutdown)
         m, wh = _manager(url, rules=["no_vest"])
         self._review(m, "no_vest")
@@ -227,7 +227,7 @@ class TestVlmReview(unittest.TestCase):
         self.assertEqual([q["violated"] for q in p["vlm"]["persons"]], [False, True])
 
     def test_unreviewed_rule_pushes_directly(self):
-        # 规则在 vlm.rules 内但 REVIEWS 未定义 → 直接推送并记 warning（不误拦）
+        # 规则在 vlm.rules 内但 RULE_MODE 未定义 → 直接推送并记 warning（不误拦）
         srv, url = _serve_answer("No")
         self.addCleanup(srv.shutdown)
         m, wh = _manager(url, rules=["no_harness"])

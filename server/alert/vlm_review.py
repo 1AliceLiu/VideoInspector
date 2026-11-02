@@ -28,30 +28,21 @@ import simplejpeg
 from loguru import logger
 
 TILE = 256  # 宫格单格边长 px：4 格拼 512×512，视觉 token 少，单张 L20 一次调用 ~0.1s
+TORSO_TILE = 512  # 躯干特写用 512：反光条是细横条，256px 下低对比条带看不见（实测）
 
-PRE = "这 4 张图是同一个人连续的 4 张裁剪连拍（左上、右上、左下、右下）。"
-TAIL = "只回答一个词：yes 或 no。"
+PRE = ("These 4 images are 4 consecutive cropped frames of the same person "
+       "(top-left, top-right, bottom-left, bottom-right). ")
+TAIL = "Answer with exactly one word: yes or no."
 
-PROMPT = PRE + "此人是否在吸烟（手持香烟或口含香烟，无论是否点燃；夹在指间也算）？" + TAIL
+PROMPT = PRE + ("Is this person smoking (holding a cigarette or having one in their mouth, "
+                "whether lit or not; holding it between the fingers also counts)? ") + TAIL
 # 安全帽/反光衣是静态属性，一帧即可判，无需连拍（省 ~0.5s 采样等待）。
 # 两问合一：把"是否真实人员"折进同一问句——非真人框(护栏/阴影/车辆)答 no → 被排除，
-# 堵死"假人必然没戴帽"的极性漏洞。三条规则极性统一：yes = 违规坐实。
-# 判据按业务定义写进 prompt（灰边说明/硬壳帽 vs 布帽/反光条背心 vs 橙工作服）：
-# 边界案例模型与人眼一样看不清时，显式定义就是最后的裁判标准。
-HELMET_PROMPT = ("下图为一次告警目标的裁剪图（右侧或下方的灰色区域是补白，不是画面内容）。"
-                 "安全帽指硬质头盔，常见黄/白/红/蓝/橙色；布帽、遮阳帽、草帽、头巾均算未佩戴。"
-                 "若目标是真实人员且头上未佩戴安全帽，答 yes；"
-                 "若已佩戴安全帽、或目标不是真实人员（物体/阴影/车辆等），答 no。" + TAIL)
-VEST_PROMPT = ("下图为一次告警目标的裁剪图（右侧或下方的灰色区域是补白，不是画面内容）。"
-               "香港工程反光衣指高可视颜色且带银灰反光条的背心；普通橙色短袖、长袖工作服均算未穿着。"
-               "若目标是真实人员且未穿着香港工程反光衣，答 yes；"
-               "若已穿着、或目标不是真实人员（物体/阴影/车辆等），答 no。" + TAIL)
-
 # 规则 → (复核问题, 违规确认答案, 连拍帧数)。
+# 说明：PPE（no_helmet/no_vest）已改走 v3 部件问句（见下方 HEAD/TORSO_PROMPT + RULE_MODE），
+# 不再使用整人裁剪图；REVIEWS 仅保留吸烟（burst）供旁路脚本复用。
 REVIEWS = {
     "smoking": (PROMPT, "yes", 4),
-    "no_helmet": (HELMET_PROMPT, "yes", 1),
-    "no_vest": (VEST_PROMPT, "yes", 1),
 }
 
 # ---------------------------------------------------------------- v3 判问体系
@@ -61,10 +52,30 @@ REVIEWS = {
 #   判帽 = 头肩特写（全人裁剪里帽子只有几十像素）
 #   判衣 = 躯干特写
 # 考卷成绩：v1 复合 66.7% / fewshot 86.1% / v3 部件问 17/17=100%（n 小，持续攒样本）。
-PERSON_PROMPT = ("图中红框标记的目标是否为一名真实人员（而非护栏/阴影/车辆/机械/覆盖物）？"
-                 "只回答一个词：yes 或 no。")
-HEAD_PROMPT = "这是一名人员头肩部的特写。此人头上是否佩戴了安全帽？只回答一个词：yes 或 no。"
-TORSO_PROMPT = "这是一名人员躯干部的特写。此人是否穿着带反光条的工程反光背心？只回答一个词：yes 或 no。"
+PERSON_PROMPT = ("Is the target marked by the red box in the image a real person "
+                 "(rather than a guardrail, shadow, vehicle, machinery, or covering)? "
+                 "Answer with exactly one word: yes or no.")
+# PPE 问句必须用「如果…回答 yes，否则 no」的对齐句式：
+# 实测"是否佩戴…？"句式系统性偏否（头部 19/19 误答未戴、躯干 20/20 误答未穿，
+# 而自由描述明明说出"黄色安全帽/反光背心"）；对齐句式 3/3 正确、分布合理。
+# 注意：判人问句不要用对齐句式（模型会复述题目而非作答，实测输出"图"）。
+# 实测（2026-10-30，40 张真实头肩图）：带业务判据的详细版 33/33，
+# 简短版 32/33——错例正是"草帽"（详细版的"草帽不算安全帽"条款救回）。
+HEAD_PROMPT = ("This is a close-up of a person's head and shoulders. A safety helmet means "
+               "a hard hat (commonly yellow, white, red, blue, or orange); cloth caps, sun hats, "
+               "straw hats, and headscarves do not count as safety helmets by themselves. Note: "
+               "on construction sites, sun visors, sun capes, and neck covers are often attached "
+               "to safety helmets, or a sun hat is worn over a safety helmet. As long as the hard "
+               "shell is visible (hemispherical crown, headband, hard edge under the brim), it "
+               "counts as wearing a safety helmet; this applies equally to front, side, and rear "
+               "views. If this person is wearing a safety helmet on their head, answer yes; "
+               "otherwise answer no.")
+TORSO_PROMPT = ("This is a close-up of a person's torso (from the shoulders down to the thighs). "
+                "A Hong Kong construction reflective vest means reflective workwear with reflective "
+                "stripes: any color shade is acceptable, and the style may be a vest, waistcoat, "
+                "long-sleeve or short-sleeve; ordinary clothing without any reflective stripes "
+                "does not count. If this person is wearing reflective clothing with reflective "
+                "stripes, answer yes; otherwise answer no.")
 
 RULE_MODE = {   # 规则 → (复核方式, 违规确认值, 连拍帧数)
     "smoking": ("burst", "yes", 4),
@@ -83,26 +94,30 @@ def redbox_view(frame: np.ndarray, bbox, w: int = 960, h: int = 540) -> bytes:
     return cv2.imencode(".jpg", vis)[1].tobytes()
 
 
-def _part_crop(frame: np.ndarray, bbox, y0f: float, y1f: float, out: int = TILE) -> np.ndarray:
+def _part_crop(frame: np.ndarray, bbox, y0f: float, y1f: float, out: int = TILE,
+               xpad: float = 0.2) -> np.ndarray:
     x1, y1, x2, y2 = bbox
     bh, bw = y2 - y1, x2 - x1
     sub = frame[max(0, int(y1 + y0f * bh)):max(1, int(y1 + y1f * bh)),
-                max(0, int(x1 - 0.2 * bw)):min(frame.shape[1], int(x2 + 0.2 * bw))]
+                max(0, int(x1 - xpad * bw)):min(frame.shape[1], int(x2 + xpad * bw))]
     if sub.size == 0:
         return np.zeros((out, out, 3), np.uint8)
     sh, sw = sub.shape[:2]
     s = out / max(sh, sw)
-    rs = cv2.resize(sub, (max(1, int(sw * s)), max(1, int(sh * s))), interpolation=cv2.INTER_AREA)
+    interp = cv2.INTER_LANCZOS4 if s >= 1 else cv2.INTER_AREA   # 放大用 LANCZOS 保边缘，缩小用 AREA
+    rs = cv2.resize(sub, (max(1, int(sw * s)), max(1, int(sh * s))), interpolation=interp)
     return cv2.copyMakeBorder(rs, 0, out - rs.shape[0], 0, out - rs.shape[1],
                               cv2.BORDER_CONSTANT, value=(114, 114, 114))
 
 
 def head_crop(frame, bbox, out: int = TILE):
-    return _part_crop(frame, bbox, -0.10, 0.45, out)      # 头肩特写
+    # 裁剪几何保持纵向原值（-10%→45%）；横向按业务要求收窄（xpad 0.2→0）
+    return _part_crop(frame, bbox, -0.10, 0.45, out, xpad=0.0)
 
 
-def torso_crop(frame, bbox, out: int = TILE):
-    return _part_crop(frame, bbox, 0.25, 1.0, out)        # 躯干特写
+def torso_crop(frame, bbox, out: int = TORSO_TILE):
+    # 纵向 10%→100%（含肩/上胸）；横向收窄（xpad=0）；512px 让反光细条可见
+    return _part_crop(frame, bbox, 0.10, 1.0, out, xpad=0.0)
 
 
 def judge_ppe(url: str, model: str, frame: np.ndarray, bbox, rule: str,

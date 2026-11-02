@@ -1,18 +1,21 @@
-"""VLM 主动巡检（config vlm.audit=true 启用）：GPU 空闲期让大模型"巡逻"全部摄像头。
+"""低置信巡检（vlm.audit=true）：pgie@0.25 已给出框，VLM 只判人+判穿戴，**不做定位**。
 
-每路每 audit_interval_s 秒：取最新证据帧 → 大模型全屏点名所有真实人员（grounding
-归一化框）→ 与检测器本帧上报的人框比对，**不重叠的 = 检测器漏掉的可疑目标** →
-用 v3 部件问句（全图红框判真人 + 头/躯干特写判穿戴）二次确认 → 两级都过才记
-`vlm-audit` 日志（只观察不推告警），作为召回审计与后续补报的数据源。
+节奏（2026-10-30 定稿）：
+  每 audit_cycle_s（默认 2s）收各路 manager.last_low_objects（0.25~业务门）→
+  排除与 ≥0.6 框重叠 → IoU+TTL 去重（同位置 audit_dedup_ttl_s=60s 内只审一次）→
+  新框进线程池（默认 8 并发，目标 1 秒内消化当轮）→ 每人 3 问：
+    全图+红框"是真人吗" → 头肩"戴帽吗" → 躯干"穿衣吗"，违规=真人∧未穿戴。
+命中只记 vlm-audit 日志 + 落盘证据图（temp2/vlm-audit），**不推告警**。
 
-为什么这样设计：全屏点名本身会幻觉（实测把 4 人数成 12），但"点名 → 裁剪复核"
-两级串联后，幻觉框会在复核级被"非真实人员"挡掉（s02 半个人案例则能被捞回）。
-对检测流零影响：只读帧缓存 + 发 HTTP，独立 daemon 线程，速率受 interval 限制。
+为什么不再全屏点名：实测 VLM 的 grounding 会把配电箱/护栏框成"人"，且"判人"级
+无法可靠否决自己的 hallucination（同模型自证）。定位交回小模型符合各自能力边界。
 """
 
-import re
+import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 import cv2
 from loguru import logger
@@ -21,19 +24,6 @@ try:
     from server.alert import vlm_review
 except ImportError:                      # 容器内平铺单测/验证时
     import vlm_review
-
-SCENE_PROMPT = ("这是工地监控画面。列出画面中所有真实人员（护栏/阴影/车辆/机械/覆盖物"
-                "不是人）。每人输出一行，格式严格为：人|x1,y1,x2,y2（坐标0-1000归一化）。"
-                "只输出行，不要其他文字。")
-
-
-def parse_scene(text: str, w: int, h: int):
-    out = []
-    for m in re.finditer(r"(\d{1,4})\s*,\s*(\d{1,4})\s*,\s*(\d{1,4})\s*,\s*(\d{1,4})", text):
-        x1, y1, x2, y2 = (int(v) for v in m.groups())
-        if x2 > x1 and y2 > y1:
-            out.append((x1 * w / 1000, y1 * h / 1000, x2 * w / 1000, y2 * h / 1000))
-    return out
 
 
 def iou(a, b):
@@ -44,62 +34,131 @@ def iou(a, b):
     return inter / max(1, area - inter)
 
 
-def audit_frame(frame, known_boxes, url, model, timeout=5.0):
-    """返回检测器漏报且经二级确认的可疑违规 [(bbox, rule, person, wearing)]。
+def overlaps_any(bb, boxes, thr=0.3):
+    return any(iou(bb, kb) > thr for kb in boxes)
 
-    幻觉控制：点名框按面积取前 3（真人通常比幻觉框大）；判人只问一次，
-    非真人立即跳过（实测幻觉框 100% 死在这一级）。
+
+def select_candidates(lows, highs, recent, now, ttl, limit=6):
+    """纯函数：从低置信框里挑本轮要审的。
+
+    lows/highs: [(bbox, conf)] / [bbox]；recent: [(bbox, ts)]（已审缓存）。
+    规则：排除与 ≥0.6 重叠；与 TTL 内已审框 IoU>0.5 跳过；本轮内互相去重；按 conf 降序取前 limit。
     """
-    h, w = frame.shape[:2]
-    small = cv2.resize(frame, (960, 540))
-    jpeg = cv2.imencode(".jpg", small)[1].tobytes()
-    text = vlm_review.ask_text(url, model, jpeg, SCENE_PROMPT, max_tokens=220,
-                               timeout=timeout)
-    claims = parse_scene(text or "", w, h)
-    claims.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
-    hits = []
-    for bb in claims[:3]:
-        if any(iou(bb, kb) > 0.3 for kb in known_boxes):
-            continue                                   # 检测器已看到，不重复审计
-        person = vlm_review.ask(url, model, vlm_review.redbox_view(frame, bb),
-                                vlm_review.PERSON_PROMPT, timeout)
-        if person != "yes":
+    recent_boxes = [r[0] for r in recent if now - r[1] < ttl]
+    out = []
+    for bbox, conf in sorted(lows, key=lambda x: -x[1]):
+        if overlaps_any(bbox, highs, 0.3):
             continue
-        for rule, prompt, cropf in (
-                ("no_helmet", vlm_review.HEAD_PROMPT, vlm_review.head_crop),
-                ("no_vest", vlm_review.TORSO_PROMPT, vlm_review.torso_crop)):
-            wearing = vlm_review.ask(url, model,
-                                     vlm_review.simplejpeg_encode(cropf(frame, bb)),
-                                     prompt, timeout)
-            if wearing == "no":
-                hits.append((bb, rule, person, wearing))
-    return hits
+        if overlaps_any(bbox, recent_boxes, 0.5):
+            continue
+        if overlaps_any(bbox, [o[0] for o in out], 0.5):
+            continue
+        out.append((bbox, conf))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def review_person(url, model, frame, bbox, timeout=2.0):
+    """1 人 3 问（简单极性，违规在代码侧判定）。返回 (person, helmet, vest, violated, jpegs, ms)。"""
+    t0 = time.monotonic()
+    person_jpeg = vlm_review.redbox_view(frame, bbox)
+    person = vlm_review.ask(url, model, person_jpeg, vlm_review.PERSON_PROMPT, timeout)
+    helmet = vest = None
+    head_jpeg = torso_jpeg = None
+    violated = []
+    if person == "yes":
+        head_jpeg = vlm_review.simplejpeg_encode(vlm_review.head_crop(frame, bbox))
+        helmet = vlm_review.ask(url, model, head_jpeg, vlm_review.HEAD_PROMPT, timeout)
+        if helmet == "no":
+            violated.append("no_helmet")
+        torso_jpeg = vlm_review.simplejpeg_encode(vlm_review.torso_crop(frame, bbox))
+        vest = vlm_review.ask(url, model, torso_jpeg, vlm_review.TORSO_PROMPT, timeout)
+        if vest == "no":
+            violated.append("no_vest")
+    jpegs = {"person": person_jpeg, "head": head_jpeg, "torso": torso_jpeg}
+    return person, helmet, vest, violated, jpegs, round((time.monotonic() - t0) * 1000)
 
 
 def start(frame_cache, managers: dict, vlm: dict):
-    """managers: {source_id: AlertManager}（取 .last_objects 作检测器本帧名单）。"""
-    interval = float(vlm.get("audit_interval_s", 90))
+    """managers: {source_id: AlertManager}（取 .last_low_objects 作候选）。"""
+    cycle = float(vlm.get("audit_cycle_s", 2))
+    ttl = float(vlm.get("audit_dedup_ttl_s", 60))
+    workers = int(vlm.get("audit_workers", 8))
+    per_cycle = int(vlm.get("audit_max_per_cycle", 6))
+    timeout = float(vlm.get("timeout", 2))
     url, model = vlm.get("url", ""), vlm.get("model", "")
+    dump_dir = vlm.get("audit_dump_dir", "temp2/vlm-audit")
+    if dump_dir:
+        os.makedirs(dump_dir, exist_ok=True)
+
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="vlm-audit")
+    recent: dict[int, list] = {}
+    inflight = [0]
+    lock = threading.Lock()
+
+    def job(sid, camera, bbox, tag):
+        try:
+            entry = frame_cache.latest_with_meta(sid)
+            frame = entry[0].bgr() if entry is not None else None
+            if frame is None:
+                return
+            person, helmet, vest, violated, jpegs, ms = review_person(
+                url, model, frame, bbox, timeout)
+            if not violated:
+                return
+            if dump_dir:
+                base = os.path.join(dump_dir, tag)
+                for part, blob in jpegs.items():
+                    if blob:
+                        with open(f"{base}_{part}.jpg", "wb") as fp:
+                            fp.write(blob)
+                # 干净全帧（无红框，原始分辨率 1080p）：供未来重裁剪/换问句的离线 A/B 实验
+                # 注意磁盘：约 0.3MB/命中；长时间开巡检时留意 temp2 体积
+                cv2.imwrite(f"{base}_frame.jpg", frame)
+            for rule in violated:
+                wearing = helmet if rule == "no_helmet" else vest
+                logger.info("vlm-audit camera={} rule={} person={} wearing={} "
+                            "bbox=({},{},{},{}) → 低置信漏报候选 ({}ms, 图: {}/{}_*.jpg)",
+                            camera, rule, person, wearing, *bbox, ms, dump_dir, tag)
+        except Exception:
+            logger.exception("vlm-audit 判定异常 camera={}", camera)
+        finally:
+            with lock:
+                inflight[0] -= 1
 
     def loop():
-        sids = list(managers)
-        i = 0
         while True:
-            sid = sids[i % len(sids)]
-            i += 1
-            time.sleep(interval / max(1, len(sids)))     # 均摊：全轮一遍≈interval
+            t0 = time.monotonic()
             try:
-                entry = frame_cache.latest_with_meta(sid)
-                if entry is None:
-                    continue
-                frame = entry[0].bgr()
-                known = [o.bbox for o in (managers[sid].last_objects or [])]
-                for bb, rule, person, wearing in audit_frame(frame, known, url, model):
-                    logger.info("vlm-audit camera={} rule={} person={} wearing={} "
-                                "bbox=({:.0f},{:.0f},{:.0f},{:.0f}) → 检测器漏报候选",
-                                managers[sid].camera_name, rule, person, wearing, *bb)
+                for sid, mgr in list(managers.items()):
+                    if inflight[0] >= workers * 4:      # 背压：队列过深先不采集
+                        break
+                    lows = [(o.bbox, o.confidence) for o in (mgr.last_low_objects or [])]
+                    if not lows:
+                        continue
+                    highs = [o.bbox for o in (mgr.last_objects or [])]
+                    now = time.monotonic()
+                    new = select_candidates(lows, highs, recent.get(sid, []),
+                                            now, ttl, per_cycle)
+                    if not new:
+                        continue
+                    entry = frame_cache.latest_with_meta(sid)
+                    if entry is None:
+                        continue
+                    # 只更新去重缓存；帧在 job 里取最新（转换只发生在有候选的路）
+                    recent.setdefault(sid, []).extend(new)
+                    recent[sid] = [r for r in recent[sid] if now - r[1] < ttl * 2]
+                    bjts = ((datetime.now(timezone.utc) + timedelta(hours=8))
+                            .strftime("%m%d-%H%M%S"))
+                    for k, (bbox, _conf) in enumerate(new):
+                        tag = f"{bjts}_{sid}p{k}"
+                        with lock:
+                            inflight[0] += 1
+                        pool.submit(job, sid, mgr.camera_name, bbox, tag)
             except Exception:
-                logger.exception("vlm-audit 巡检异常 source={}", sid)
+                logger.exception("vlm-audit 采集异常")
+            time.sleep(max(0.0, cycle - (time.monotonic() - t0)))
 
     t = threading.Thread(target=loop, daemon=True, name="vlm-audit")
     t.start()
