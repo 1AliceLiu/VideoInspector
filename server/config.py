@@ -108,6 +108,19 @@ def validate_config(config: dict, path: Path):
         unknown = [r for r in vlm_cfg.get("rules") or [] if r not in rule_names]
         if unknown:
             errors.append(f"vlm.rules 引用了未定义的规则: {unknown}")
+        # 分数门控（(小模型 conf + 大模型 P(yes))/2 阈值推送）：必须是被复核的规则，
+        # 否则静默不生效会误导现场。
+        gate = vlm_cfg.get("score_gate") or {}
+        gate_rules = gate.get("rules") or []
+        unknown_gate = [r for r in gate_rules if r not in rule_names]
+        if unknown_gate:
+            errors.append(f"vlm.score_gate.rules 引用了未定义的规则: {unknown_gate}")
+        not_reviewed = [r for r in gate_rules if r not in (vlm_cfg.get("rules") or [])]
+        if not_reviewed:
+            errors.append(f"vlm.score_gate.rules 必须同时出现在 vlm.rules 中: {not_reviewed}")
+        thr = gate.get("threshold")
+        if thr is not None and not (isinstance(thr, (int, float)) and 0.0 < thr <= 1.0):
+            errors.append(f"vlm.score_gate.threshold 必须在 (0,1] 内，当前: {thr!r}")
 
     webhook = config.get("webhook") or {}
     timeout = webhook.get("timeout")

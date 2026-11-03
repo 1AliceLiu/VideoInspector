@@ -336,9 +336,13 @@ class AlertManager:
 
         采样等待（≤ deadline）与 VLM HTTP 全部阻塞在本线程，不占检测/executor 线程。
         每规则的问题/确认方向/帧数见 vlm_review.RULE_MODE（PPE 用部件问句，吸烟用连拍宫格）。
-        shadow=true（灰度观察）：任何判定都照常推送且 payload 不附 vlm 字段，结论只进日志；
-        shadow=false：判定与违规方向相反 → 丢弃；坐实违规或（fail_open 时）不可用 →
-        走 _build_and_send 正常推送，payload 附 vlm 字段（verdict/model/frames）供下游审计。
+
+        推送门控（2026-11-03 起）：
+          - 规则在 vlm.score_gate.rules 内（当前仅 smoking）：按
+            (小模型属性 conf + 大模型 P(yes)) / 2 > threshold 决定推送，**不受 shadow 影响**；
+            VLM 不可用（拿不到分数）时按 fail_open 处置。
+          - 其余规则：shadow=true 只观察（照推、payload 不附字段）；shadow=false 时
+            verdict 与违规方向相反 → 丢弃；不可用 → fail_open（默认 true 照推）。
         """
         vlm = self.vlm or {}
         shadow = bool(vlm.get("shadow", False))
@@ -351,7 +355,11 @@ class AlertManager:
         kind, expect, nframes = mode
         url, model = vlm.get("url", ""), vlm.get("model", "")
         timeout = float(vlm.get("timeout", 5))
+        gate = vlm.get("score_gate") or {}
+        gate_rules = set(gate.get("rules") or ())
+        gate_thr = float(gate.get("threshold", 0.75))
         persons, crops, verdict = [], [], None
+        vlm_score = small_score = None
         t0 = t_sample = time.monotonic()
         try:
             if kind == "burst":        # 吸烟：连拍宫格单问（极性天然简单，垃圾框答 no 自排除）
@@ -364,9 +372,14 @@ class AlertManager:
                     pad=float(vlm.get("pad", 0.15)),
                 )
                 t_sample = time.monotonic()
+                # 小模型分数：该 person 上本规则属性（烟头检测）的置信度
+                small_score = next(
+                    (a.confidence for a in best.attributes if a.name == rule_name),
+                    best.confidence)
                 if crops:
-                    verdict = vlm_review.ask(url, model, vlm_review.build_grid(crops),
-                                             vlm_review.PROMPT, timeout)
+                    verdict, vlm_score = vlm_review.ask_score(
+                        url, model, vlm_review.build_grid(crops),
+                        vlm_review.PROMPT, timeout)
             else:                      # PPE：逐人复核（一图多人全进名单），全图红框判人+部位特写判穿戴
                 frame = snapshot if isinstance(snapshot, np.ndarray) else None
                 if frame is None:
@@ -389,23 +402,44 @@ class AlertManager:
             logger.exception("vlm-review 流程异常 camera={}", self.camera_id)
         # 全链路延迟：小模型告警触发（本线程启动）→ 采样/判问 → 大模型判定返回
         t_end = time.monotonic()
+        avg = ((small_score + vlm_score) / 2.0
+               if (rule_name in gate_rules and small_score is not None
+                   and vlm_score is not None) else None)
         logger.info("vlm-review camera={} rule={} verdict={} frames={} "
-                    "sample={}ms infer={}ms total={}ms persons={}",
+                    "sample={}ms infer={}ms total={}ms persons={} score={}",
                     self.camera_name, alert_type, verdict or "skipped",
                     len(crops) or len(persons),
                     round((t_sample - t0) * 1000), round((t_end - t_sample) * 1000),
-                    round((t_end - t0) * 1000), len(persons))
+                    round((t_end - t0) * 1000), len(persons),
+                    "-" if avg is None else
+                    f"small={small_score:.3f} vlm={vlm_score:.3f} avg={avg:.3f}")
         review = {"verdict": verdict or "skipped", "model": model,
                   "frames": len(crops) or len(persons)}
         if persons:
             review["persons"] = persons
-        if not shadow and ((verdict is not None and verdict != expect)
-                           or (verdict is None and not vlm.get("fail_open", True))):
+        gated = rule_name in gate_rules
+        if gated:
+            # 分数门控：平均分 > 阈值才推送（不受 shadow 影响）；无分数按 fail_open。
+            review["scores"] = {"small": None if small_score is None else round(small_score, 3),
+                                "vlm": None if vlm_score is None else round(vlm_score, 3),
+                                "avg": None if avg is None else round(avg, 3),
+                                "threshold": gate_thr}
+            if avg is None and not vlm.get("fail_open", True):
+                logger.info("vlm-review camera={} rule={} score=skipped → 丢弃(fail_open=false)",
+                            self.camera_name, alert_type)
+                return
+            if avg is not None and avg <= gate_thr:
+                logger.info("vlm-review camera={} rule={} score=small={:.3f} vlm={:.3f} "
+                            "avg={:.3f} → 丢弃(阈值 {})", self.camera_name, alert_type,
+                            small_score, vlm_score, avg, gate_thr)
+                return
+        elif not shadow and ((verdict is not None and verdict != expect)
+                             or (verdict is None and not vlm.get("fail_open", True))):
             logger.info("vlm-review camera={} rule={} verdict={} → 丢弃",
                         self.camera_name, alert_type, review["verdict"])
             return
         self._build_and_send(rule_name, alert_type, snapshot, alert_objects,
-                             iso_timestamp, review=None if shadow else review)
+                             iso_timestamp, review=None if (shadow and not gated) else review)
 
     # ------------------------------------------------------------------
     # 后台线程：JPEG 编码（executor）→ fire-and-forget 推送（daemon）

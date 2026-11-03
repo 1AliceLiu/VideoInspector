@@ -151,6 +151,12 @@ vlm:
   timeout: 2                           # 单次复核 HTTP 上限（infer 实测 p95≈250ms，足够宽裕）
   pad: 0.15
   fail_open: true
+  # 分数门控（2026-11-03）：命中的规则不看 shadow，直接按
+  # (小模型属性 conf + 大模型 P(yes))/2 > threshold 决定是否推送；
+  # VLM 不可用（拿不到分数）时按 fail_open 处置（true=照常推送）。
+  score_gate:
+    rules: [smoking]
+    threshold: 0.75
   audit: false           # 低置信巡检暂停（2026-11-02；恢复改 true + 重启）
   audit_cycle_s: 2       # 采集周期：每 2 秒收一轮全路低置信框 → 去重 → 线程池审核
   audit_dedup_ttl_s: 60  # 同一位置 60 秒内只审一次（IoU>0.5 视为同一目标）
@@ -365,11 +371,29 @@ cameras:
     enabled: true
     active_rules: ["no_helmet", "smoking"]    
 
-  - id: "1942"
+  - id: "1924"
     name: "AI Camera1924"
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1002500"
     enabled: true
     active_rules: ["no_helmet", "smoking"]  
+
+  - id: "2674"
+    name: "AI Camera2674"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003184"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"] 
+
+  - id: "2675"
+    name: "AI Camera2675"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003183"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
+  - id: "2676"
+    name: "AI Camera2676"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003185"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
 # -----------------------------------------------------------------------------
 # RTSP 输入
 # -----------------------------------------------------------------------------

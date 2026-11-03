@@ -9,6 +9,7 @@ HTTP 服务模拟 OpenAI 兼容 /v1/chat/completions。需要 cv2/numpy/simplejp
 from __future__ import annotations
 
 import json
+import math
 import sys
 import threading
 import time
@@ -115,6 +116,37 @@ def _serve_seq(seq: list):
             ans = seq[min(state["i"], len(seq) - 1)]
             state["i"] += 1
             body = json.dumps({"choices": [{"message": {"content": ans}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_port}/v1/chat/completions"
+
+
+def _serve_scored(p_yes: float):
+    """带 logprobs 的假服务：首 token 分布里 yes=p_yes / no=1-p_yes（分数门控用例）。"""
+    p = {"yes": p_yes, "no": 1.0 - p_yes}
+    word = max(p, key=p.get)
+    top = [{"token": t, "logprob": math.log(max(v, 1e-9))} for t, v in p.items()]
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = json.dumps({"choices": [{
+                "message": {"content": word},
+                "logprobs": {"content": [{
+                    "token": word,
+                    "logprob": math.log(max(p[word], 1e-9)),
+                    "top_logprobs": top,
+                }]},
+            }]}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -257,6 +289,63 @@ class TestVlmReview(unittest.TestCase):
     def test_unreachable_fail_closed(self):
         m, wh = _manager("http://127.0.0.1:1/v1/chat/completions", fail_open=False)
         self._review(m)
+        time.sleep(0.2)
+        self.assertEqual(wh.payloads, [])
+
+    # --- 分数门控（2026-11-03）：(小模型 conf + 大模型 P(yes))/2 > 0.75 才推送 ---
+    def _gated_manager(self, url, **extra):
+        return _manager(url, score_gate={"rules": ["smoking"], "threshold": 0.75}, **extra)
+
+    @staticmethod
+    def _smoking_obj(attr_conf: float):
+        return ObjectMeta("person", 0.9, (300, 100, 420, 500),
+                          (AttributeMeta("smoking", attr_conf),))
+
+    def test_score_gate_pass_pushes_with_scores(self):
+        # 小模型 0.8、大模型 0.9 → 平均 0.85 > 0.75 → 推送（shadow=true 也生效）
+        srv, url = _serve_scored(0.9)
+        self.addCleanup(srv.shutdown)
+        m, wh = self._gated_manager(url, shadow=True)
+        m._vlm_review("smoking", "smoking", [self._smoking_obj(0.8)],
+                      self.snapshot(), "2026-01-01T00:00:00+00:00")
+        p = self._wait_payload(wh)
+        self.assertIsNotNone(p)
+        self.assertEqual(p["vlm"]["scores"]["avg"], 0.85)
+        self.assertEqual(p["vlm"]["scores"]["threshold"], 0.75)
+
+    def test_score_gate_drop_below_threshold(self):
+        # 小模型 0.8、大模型 0.5 → 平均 0.65 ≤ 0.75 → 丢弃
+        srv, url = _serve_scored(0.5)
+        self.addCleanup(srv.shutdown)
+        m, wh = self._gated_manager(url)
+        m._vlm_review("smoking", "smoking", [self._smoking_obj(0.8)],
+                      self.snapshot(), "2026-01-01T00:00:00+00:00")
+        time.sleep(0.2)
+        self.assertEqual(wh.payloads, [])
+
+    def test_score_gate_equal_threshold_drops(self):
+        # 平均恰好 0.75 → 严格大于才推，应丢弃
+        srv, url = _serve_scored(0.7)
+        self.addCleanup(srv.shutdown)
+        m, wh = self._gated_manager(url)
+        m._vlm_review("smoking", "smoking", [self._smoking_obj(0.8)],
+                      self.snapshot(), "2026-01-01T00:00:00+00:00")
+        time.sleep(0.2)
+        self.assertEqual(wh.payloads, [])
+
+    def test_score_gate_vlm_down_fail_open(self):
+        m, wh = self._gated_manager("http://127.0.0.1:1/v1/chat/completions")
+        m._vlm_review("smoking", "smoking", [self._smoking_obj(0.9)],
+                      self.snapshot(), "2026-01-01T00:00:00+00:00")
+        p = self._wait_payload(wh)
+        self.assertIsNotNone(p)
+        self.assertEqual(p["vlm"]["verdict"], "skipped")
+
+    def test_score_gate_vlm_down_fail_closed(self):
+        m, wh = self._gated_manager("http://127.0.0.1:1/v1/chat/completions",
+                                    fail_open=False)
+        m._vlm_review("smoking", "smoking", [self._smoking_obj(0.9)],
+                      self.snapshot(), "2026-01-01T00:00:00+00:00")
         time.sleep(0.2)
         self.assertEqual(wh.payloads, [])
 

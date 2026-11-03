@@ -19,6 +19,7 @@ rules 只支持 REVIEWS 中的键名，未定义的规则直接推送并告警�
 
 import base64
 import json
+import math
 import time
 import urllib.request
 
@@ -227,3 +228,50 @@ def ask(url: str, model: str, jpeg: bytes, prompt: str = PROMPT, timeout: float 
     if not text:
         return None
     return "yes" if text.startswith("y") else "no"
+
+
+def ask_score(url: str, model: str, jpeg: bytes, prompt: str = PROMPT, timeout: float = 5.0):
+    """yes/no 单问 + 分数：返回 (verdict, p_yes)。
+
+    p_yes = 首 token 里所有 yes 变体概率 / (yes 变体 + no 变体)，用于与小模型分数做
+    平均门控（2026-11-03）。服务端不返回 logprobs（非 vLLM 或旧版本）时退化为
+    硬判定 1.0/0.0；请求失败返回 (None, None)，调用方按 fail_open 处置。
+    """
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,"
+                                                       + base64.b64encode(jpeg).decode("ascii")}},
+        ]}],
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "logprobs": True,
+        "top_logprobs": 20,
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=body,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            answer = json.loads(resp.read())
+    except Exception as exc:
+        logger.warning("vlm-review 请求失败 url={} err={}", url, exc)
+        return None, None
+    try:
+        choice = answer["choices"][0]
+        text = str(choice["message"]["content"]).strip().lower()
+        verdict = "yes" if text.startswith("y") else "no"
+        cands = choice["logprobs"]["content"][0]["top_logprobs"]
+        py = sum(math.exp(t["logprob"]) for t in cands
+                 if str(t["token"]).strip().lower().startswith("y"))
+        pn = sum(math.exp(t["logprob"]) for t in cands
+                 if str(t["token"]).strip().lower().startswith("n"))
+        p_yes = py / (py + pn) if (py + pn) > 0 else None
+        return verdict, (p_yes if p_yes is not None else (1.0 if verdict == "yes" else 0.0))
+    except (KeyError, IndexError, TypeError, ValueError):
+        # 无 logprobs 的兼容路径：按硬判定给 1.0/0.0
+        text = str(answer.get("choices", [{}])[0].get("message", {}).get("content", "")).lower()
+        if not text:
+            return None, None
+        verdict = "yes" if text.startswith("y") else "no"
+        return verdict, (1.0 if verdict == "yes" else 0.0)
