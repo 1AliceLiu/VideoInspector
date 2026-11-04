@@ -146,9 +146,9 @@ vlm:
   url: http://vllm:8013/v1/chat/completions
   model: /model/Qwen2.5-VL-7B-Instruct-AWQ
   rules: [smoking, no_helmet, no_vest]   # 复核问题与确认极性见 server/alert/vlm_review.py REVIEWS
-  sample_ms: 120                       # 吸烟连拍帧间隔（安全帽/反光衣 1 帧，无采样等待）
-  deadline_ms: 1500
-  timeout: 2                           # 单次复核 HTTP 上限（infer 实测 p95≈250ms，足够宽裕）
+  sample_ms: 700                       # 吸烟时序帧间隔：8 帧覆盖 ~5s 窗口（安全帽/反光衣 1 帧，无采样等待）
+  deadline_ms: 5500                    # 采样兜底：断流/人走出画面时最迟 5.5s 发起终审
+  timeout: 4                           # 单次复核 HTTP 上限（1024×512 宫格 infer 实测 ~0.7s，留余量）
   pad: 0.15
   fail_open: true
   # 分数门控（2026-11-03）：命中的规则不看 shadow，直接按
@@ -400,6 +400,42 @@ cameras:
     rtsp_url: "rtsp://118.140.234.166:8554/dahua1003179"
     enabled: true
     active_rules: ["no_helmet", "no_vest", "smoking"] 
+
+  - id: "2740"
+    name: "AI Camera2740"
+    rtsp_url: "rtsp://172.16.100.4:9090/dss/monitor/params?cameraid=1003233%240&substream=1"
+    enabled: true
+    active_rules: ["no_helmet"]
+
+  - id: "2741"
+    name: "AI Camera2741"
+    rtsp_url: "rtsp://172.16.100.4:9090/dss/monitor/params?cameraid=1003234%240&substream=1"
+    enabled: true
+    active_rules: ["no_helmet"]
+
+  - id: "2742"
+    name: "AI Camera2742"
+    rtsp_url: "rtsp://172.16.100.4:9090/dss/monitor/params?cameraid=1003235%240&substream=1"
+    enabled: true
+    active_rules: ["no_helmet"]
+
+  - id: "500"
+    name: "AI Camera500"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1000361"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
+  - id: "496"
+    name: "AI Camera496"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1000362"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
+  - id: "353"
+    name: "AI Camera353"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua353"
+    enabled: true
+    active_rules: ["no_helmet"]
 # -----------------------------------------------------------------------------
 # RTSP 输入
 # -----------------------------------------------------------------------------

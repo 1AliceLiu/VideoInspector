@@ -1,10 +1,16 @@
-"""告警的视觉大模型二级复核：连续 4 帧人像裁剪 → 2×2 宫格图 → yes/no。
+"""告警的视觉大模型二级复核：5 秒窗口 8 帧时序人像裁剪 → 2×4 宫格图 → yes/no。
 
 定位（配置见 deploy/config.yaml vlm 节）：小模型仍走既有 DeepStream 链实时初筛；
 状态机触发告警后**不直接推 webhook**，本模块在证据帧缓存里轮询触发后的新帧（采样与
-HTTP 全在告警 daemon 线程，不碰检测流线程），按触发时刻的 person bbox 裁剪连拍人像，
-拼成 2×2 宫格图（一次调用覆盖 ~0.5s 连拍，固定开销只付一遍），问 OpenAI 兼容接口
-（如 vLLM 部署的 Qwen2.5-VL，max_tokens=1）。每规则的复核问题与违规确认方向见 REVIEWS。
+HTTP 全在告警 daemon 线程，不碰检测流线程），按触发时刻的 person bbox 裁剪 5 秒窗口
+内 8 帧时序人像（sample_ms≈700ms），拼成 2×4 宫格图（一次调用覆盖整个动作窗口，
+固定开销只付一遍），问 OpenAI 兼容接口（如 vLLM 部署的 Qwen2.5-VL，max_tokens=1）。
+每规则的复核问题与违规确认方向见 REVIEWS。
+
+时序化（2026-11-04）：单帧/0.4s 连拍把"手到嘴边"的瞬时姿势误读为吸烟；5 秒跨帧窗口
+让吸烟的重复动作与烟头多角度露出成为可判特征。沙盒实测依据见 temp/live-smoking-win。
+shortcut: 5 秒内仍按触发时刻的固定 bbox 裁剪，人不追框——快速出画者尾部帧可能是背景；
+若时序误判率明显高于沙盒（沙盒逐帧重检），再上追框。
 
 判定语义（shadow=true 观察模式下不拦告警、payload 不附字段，结论只进日志）：
   verdict == 确认方向 → 正常推送（payload 附 vlm.verdict）
@@ -13,7 +19,7 @@ HTTP 全在告警 daemon 线程，不碰检测流线程），按触发时刻的 
 
 配置键 deploy/config.yaml vlm 节：enabled/shadow/url/model/rules/
 sample_ms/deadline_ms/pad（bbox 外扩比例，默认 0.15）/fail_open/timeout；
-每规则的问题/确认方向/连拍帧数在 REVIEWS（吸烟 4 帧，安全帽/反光衣 1 帧）。
+每规则的问题/确认方向/时序帧数在 REVIEWS（吸烟 8 帧跨 5s，安全帽/反光衣 1 帧）。
 rules 只支持 REVIEWS 中的键名，未定义的规则直接推送并告警（问不对问题不如不问）。
 """
 
@@ -28,22 +34,24 @@ import numpy as np
 import simplejpeg
 from loguru import logger
 
-TILE = 256  # 宫格单格边长 px：4 格拼 512×512，视觉 token 少，单张 L20 一次调用 ~0.1s
+TILE = 256  # 宫格单格边长 px：吸烟 8 帧拼 1024×512（2×4），单张 L20 一次调用 <1s
 TORSO_TILE = 512  # 躯干特写用 512：反光条是细横条，256px 下低对比条带看不见（实测）
 
-PRE = ("These 4 images are 4 consecutive cropped frames of the same person "
-       "(top-left, top-right, bottom-left, bottom-right). ")
+PRE = ("These images are consecutive cropped frames of the same person sampled over a "
+       "5-second window, in chronological order (left-to-right, top-to-bottom, earliest "
+       "first). ")
 TAIL = "Answer with exactly one word: yes or no."
 
 PROMPT = PRE + ("Is this person smoking (holding a cigarette or having one in their mouth, "
-                "whether lit or not; holding it between the fingers also counts)? ") + TAIL
+                "whether lit or not; holding it between the fingers also counts; a hand "
+                "repeatedly moving to the mouth across these frames also counts)? ") + TAIL
 # 安全帽/反光衣是静态属性，一帧即可判，无需连拍（省 ~0.5s 采样等待）。
 # 两问合一：把"是否真实人员"折进同一问句——非真人框(护栏/阴影/车辆)答 no → 被排除，
 # 规则 → (复核问题, 违规确认答案, 连拍帧数)。
 # 说明：PPE（no_helmet/no_vest）已改走 v3 部件问句（见下方 HEAD/TORSO_PROMPT + RULE_MODE），
 # 不再使用整人裁剪图；REVIEWS 仅保留吸烟（burst）供旁路脚本复用。
 REVIEWS = {
-    "smoking": (PROMPT, "yes", 4),
+    "smoking": (PROMPT, "yes", 8),
 }
 
 # ---------------------------------------------------------------- v3 判问体系
@@ -78,8 +86,8 @@ TORSO_PROMPT = ("This is a close-up of a person's torso (from the shoulders down
                 "does not count. If this person is wearing reflective clothing with reflective "
                 "stripes, answer yes; otherwise answer no.")
 
-RULE_MODE = {   # 规则 → (复核方式, 违规确认值, 连拍帧数)
-    "smoking": ("burst", "yes", 4),
+RULE_MODE = {   # 规则 → (复核方式, 违规确认值, 时序帧数)
+    "smoking": ("burst", "yes", 8),
     "no_helmet": ("ppe", "yes", 1),
     "no_vest": ("ppe", "yes", 1),
 }
@@ -164,23 +172,27 @@ def crop_person(frame: np.ndarray, bbox, out: int = TILE, pad: float = 0.15):
 
 
 def build_grid(crops: list) -> bytes:
-    """单帧直通；≤4 张裁剪拼 2×2 宫格 JPEG（不足 4 张用最后一张补齐）。"""
+    """单帧直通；≤4 张拼 2×2；5~8 张按 2×4（列=4）时序排列，不足用最后一张补齐。"""
     if len(crops) == 1:
         return simplejpeg.encode_jpeg(crops[0], quality=90, colorspace="BGR")
-    tiles = crops[:4]
+    cols = 2 if len(crops) <= 4 else 4
+    rows = 2
+    need = cols * rows
+    tiles = crops[:need]
     filler = tiles[-1] if tiles else np.zeros((TILE, TILE, 3), np.uint8)
-    while len(tiles) < 4:
+    while len(tiles) < need:
         tiles.append(filler)
-    grid = np.vstack([np.hstack(tiles[:2]), np.hstack(tiles[2:])])
+    grid = np.vstack([np.hstack(tiles[i * cols:(i + 1) * cols]) for i in range(rows)])
     return simplejpeg.encode_jpeg(grid, quality=90, colorspace="BGR")
 
 
 def collect_frames(frame_cache, source_id, bbox,
-                   frames: int = 4, sample_s: float = 0.12, deadline_s: float = 1.5,
+                   frames: int = 8, sample_s: float = 0.5, deadline_s: float = 5.5,
                    pad: float = 0.15):
     """触发时刻后从证据缓存轮询**新帧号**并裁剪人员，最多 frames 张 / deadline_s 秒。
 
-    证据缓存每路只存最新一帧（appsink 覆盖写），采样间隔 ≥ 帧间隔即可拿到连拍；
+    吸烟时序窗口：5 秒内按固定触发 bbox 采 ~8 帧（人不追框，见模块头 shortcut 说明）。
+    证据缓存每路只存最新一帧（appsink 覆盖写），采样间隔 ≥ 帧间隔即可拿到时序帧；
     断流时帧号不变，自然停止累计，由 deadline 兜底。pad 透传给 crop_person。
     """
     crops, last_fn = [], None

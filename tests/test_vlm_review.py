@@ -196,7 +196,7 @@ class TestVlmReview(unittest.TestCase):
         p = self._wait_payload(wh)
         self.assertIsNotNone(p)
         self.assertEqual(p["vlm"]["verdict"], "yes")
-        self.assertEqual(p["vlm"]["frames"], 4)
+        self.assertEqual(p["vlm"]["frames"], 8)
         self.assertIsNotNone(p["frame_base64"])  # 证据帧照常附带
 
     def test_no_discards(self):
@@ -361,6 +361,18 @@ class TestVlmReview(unittest.TestCase):
         corners = {int(arr[10, 10, 0]), int(arr[10, 266, 0]),
                    int(arr[266, 10, 0]), int(arr[266, 266, 0])}
         self.assertEqual(len(corners), 4)
+
+    def test_grid_is_2x4_chronological_for_8_frames(self):
+        crops = vlm_review.collect_frames(_Cache(), 0, OBJ.bbox,
+                                          frames=8, sample_s=0, deadline_s=2)
+        self.assertEqual(len(crops), 8)
+        arr = vlm_review.simplejpeg.decode_jpeg(vlm_review.build_grid(crops),
+                                                colorspace="BGR")
+        self.assertEqual(arr.shape, (vlm_review.TILE * 2, vlm_review.TILE * 4, 3))
+        # 时序排列：8 格采样值互不相同，且左上角格为最早帧（值最小）
+        corners = [int(arr[y, x, 0]) for y in (10, 266) for x in (10, 266, 522, 778)]
+        self.assertEqual(len(set(corners)), 8)
+        self.assertEqual(corners[0], min(corners))
 
 
 if __name__ == "__main__":
