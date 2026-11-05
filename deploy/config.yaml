@@ -29,7 +29,7 @@ model:
 
     helmet:                                    # 安全帽整帧检测
       kind: detector
-      source: models/helmet/yolo26s_helm_20260804_0844/weights/best.pt
+      source: models/helmet/yolo26s_helm_soft_hat_20261105_0925/weights/best.pt
       uid: 3
       violation: head                          # head = 未戴帽（报警类）
 
@@ -403,19 +403,19 @@ cameras:
 
   - id: "2740"
     name: "AI Camera2740"
-    rtsp_url: "rtsp://172.16.100.4:9090/dss/monitor/params?cameraid=1003233%240&substream=1"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003233"
     enabled: true
     active_rules: ["no_helmet"]
 
   - id: "2741"
     name: "AI Camera2741"
-    rtsp_url: "rtsp://172.16.100.4:9090/dss/monitor/params?cameraid=1003234%240&substream=1"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003234"
     enabled: true
     active_rules: ["no_helmet"]
 
   - id: "2742"
     name: "AI Camera2742"
-    rtsp_url: "rtsp://172.16.100.4:9090/dss/monitor/params?cameraid=1003235%240&substream=1"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003235"
     enabled: true
     active_rules: ["no_helmet"]
 
