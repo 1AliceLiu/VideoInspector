@@ -1360,3 +1360,13 @@
 2026-11-06 05:22:28,619 INFO saved camera=2676 frame=18138 person=0 head=0 helmet=0 green=0.001423
 2026-11-06 05:22:38,619 INFO saved camera=2676 frame=18263 person=0 head=0 helmet=1 green=0.001319
 2026-11-06 05:22:48,687 INFO saved camera=2676 frame=18389 person=0 head=0 helmet=0 green=0.000658
+2026-11-06 05:22:58,715 INFO saved camera=2676 frame=18514 person=0 head=0 helmet=0 green=0.001211
+2026-11-06 05:23:08,792 INFO saved camera=2676 frame=18640 person=0 head=0 helmet=0 green=0.001172
+2026-11-06 05:23:18,823 INFO saved camera=2676 frame=18766 person=1 head=0 helmet=1 green=0.001657
+2026-11-06 05:23:28,828 INFO saved camera=2676 frame=18891 person=1 head=0 helmet=2 green=0.001423
+2026-11-06 05:23:38,831 INFO saved camera=2676 frame=19016 person=1 head=0 helmet=2 green=0.001301
+2026-11-06 05:23:48,969 INFO saved camera=2676 frame=19142 person=0 head=0 helmet=1 green=0.001172
+2026-11-06 05:23:59,026 INFO saved camera=2676 frame=19268 person=0 head=0 helmet=1 green=0.001125
+2026-11-06 05:24:09,096 INFO saved camera=2676 frame=19394 person=0 head=0 helmet=0 green=0.001554
+2026-11-06 05:24:19,150 INFO saved camera=2676 frame=19520 person=0 head=0 helmet=1 green=0.001283
+2026-11-06 05:24:26,904 INFO stopping observer
