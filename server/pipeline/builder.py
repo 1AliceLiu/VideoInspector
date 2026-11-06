@@ -159,6 +159,11 @@ class PipelineBuilder:
             logger.warning("未知 source.rtsp_protocol={}，回退默认 4 (TCP)", rtsp_protocol)
             rtsp_protocol = 4
         # 解码侧抽帧：每 N 帧放行 1 帧（1=不抽帧）。全局生效，用于吞吐实验。
+        preserve_bitstream = bool(src_cfg.get("preserve_bitstream", False))
+        source_factory = "nvurisrcbin"
+        if preserve_bitstream:
+            from .video_integrity import protected_source_factory
+            source_factory = protected_source_factory()
         drop_interval = int(src_cfg.get("drop_frame_interval", 1))
         if drop_interval > 1:
             logger.info("source.drop_frame_interval={}（每 {} 帧放行 1 帧）", drop_interval, drop_interval)
@@ -186,7 +191,7 @@ class PipelineBuilder:
             # init-rtsp-reconnect-interval 是 DS9.x 的已知回归坑: 发生错误后活跃
             # 重连间隔会切换到该值，默认 0 = 禁用重连监控，必须显式设置
             # （NVIDIA 论坛 Regression #377715 官方 workaround）。
-            p.add("nvurisrcbin", f"src{i}", src_props({
+            p.add(source_factory, f"src{i}", src_props({
                 "uri": cam["rtsp_url"],
                 "select-rtp-protocol": rtsp_protocol,
                 "drop-frame-interval": drop_interval,
@@ -195,8 +200,18 @@ class PipelineBuilder:
                 "rtsp-reconnect-interval": int(rc["interval"]),
                 "init-rtsp-reconnect-interval": int(max(1, rc["interval"] // 2)),
                 "latency": int(rc["latency"]),
+                **({"drop-on-latency": False} if preserve_bitstream else {}),
             }))
-            p.link((f"src{i}", "mux"), ("", "sink_%u"))
+            if preserve_bitstream:
+                # Keep compressed RTP intact. Shed load only after decoding,
+                # where dropping a complete raw frame cannot damage H.264/H.265 references.
+                qname = f"decoded-q{i}"
+                p.add("queue", qname, {"max-size-buffers": 2, "max-size-bytes": 0,
+                                      "max-size-time": 0, "leaky": 2})
+                p.link(f"src{i}", qname)
+                p.link((qname, "mux"), ("", "sink_%u"))
+            else:
+                p.link((f"src{i}", "mux"), ("", "sink_%u"))
 
     # ------------------------------------------------------------------ 推理链
     def _add_inference_chain(self, p: Pipeline) -> str:
