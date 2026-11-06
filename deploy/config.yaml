@@ -29,7 +29,7 @@ model:
 
     helmet:                                    # 安全帽整帧检测
       kind: detector
-      source: models/helmet/yolo26s_helm_soft_hat_20261105_0925/weights/best.pt
+      source: models/helmet/yolo26s_helm_20260804_0844/weights/best.pt
       uid: 3
       violation: head                          # head = 未戴帽（报警类）
 

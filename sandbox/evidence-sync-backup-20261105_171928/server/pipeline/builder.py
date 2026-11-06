@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""DeepStream 管线构建器（源 → 推理链 → 分路输出）。"""
+
+from concurrent.futures import ThreadPoolExecutor
+import os
+from pathlib import Path
+
+from pyservicemaker import Pipeline, Probe
+
+from server.alert.manager import AlertManager
+from server.alert.rules import parse_rules, TRIGGER_PRESENCE
+from server.alert.webhook import WebhookAlerter
+from server.config import DEFAULT_RECONNECT
+from server.model_spec import KIND_CLASSIFIER, KIND_DETECTOR, anchor_uid, parse_gies
+from server.pipeline.frame_cache import FrameCache, add_evidence_capture
+from server.pipeline.ini_patch import anchor_ini_config
+from server.pipeline.probe import SafetyProbe
+
+# 管线画面尺寸（nvstreammux batch 尺寸）—— **单一事实来源**：既用于建 mux，也用于
+# 把区域的归一化坐标换算成像素（探针内命中判定与检测框同一坐标系）。mux 未启用
+# enable-padding（拉伸填满），故归一化坐标 → 像素只需各轴乘本尺寸，见 alert/regions。
+MUX_WIDTH = 1920
+MUX_HEIGHT = 1080
+
+
+def _clean_stale_shm_sockets(socket_path: str, logger) -> None:
+    """删除上次进程残留的 shm 控制 socket（base 与 .N 变体）。"""
+    import glob
+    import os
+
+    for p in glob.glob(socket_path) + glob.glob(f"{socket_path}.*"):
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("清理残留 shm socket 失败: {} ({})", p, exc)
+
+
+def _reconnect_settings(config: dict) -> dict:
+    return {**DEFAULT_RECONNECT, **((config.get("source") or {}).get("reconnect") or {})}
+
+
+def _supported_nvurisrcbin_props(logger) -> set[str] | None:
+    """用 gst-inspect 探测本机 nvurisrcbin 支持的属性名（不同 DS 版本差异大）。
+
+    返回 None 表示探测失败（届时不过滤，按原样下发，让 GStreamer 自行告警）。
+    """
+    import re
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["gst-inspect-1.0", "nvurisrcbin"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+        return set(re.findall(r"^ {2}([a-z0-9-]+)\s*:", out, re.M))
+    except Exception as exc:
+        logger.warning("gst-inspect-1.0 nvurisrcbin 探测失败，跳过属性兼容性过滤: {}", exc)
+        return None
+
+
+class PipelineBuilder:
+    """由 config 一次性构建整条 DeepStream 管线及其运行期组件。"""
+
+    def __init__(self, config: dict, deploy_root: Path):
+        self.config = config
+        self.deploy_root = deploy_root
+
+        model = config["model"]
+        self.gies = parse_gies(model.get("gies"))
+        self.rules = parse_rules(config.get("rules"))
+        self.person_uid = anchor_uid(self.gies)
+        self.person_conf_threshold = float(model.get("person_conf_threshold", 0.6))
+        # 每个 classifier gie 的 classifier-threshold 由引用它的规则 attribute_threshold 重写。
+        # presence 型规则（区域入侵）不做任何模型判定，其 attribute_threshold 只是
+        # 占位值，排除在外以免把无关阈值挂到锚点 person 上。
+        self.gie_thresholds = {
+            rule.gie: rule.attribute_threshold
+            for rule in self.rules.values()
+            if rule.trigger != TRIGGER_PRESENCE
+        }
+        self.cameras = [c for c in config.get("cameras") or [] if c.get("enabled", True)]
+
+    # ------------------------------------------------------------------ 构建
+    def build(self, logger, health=None) -> dict:
+        """构建并返回 {pipeline, frame_cache, executor, rtsp_server}。
+
+        health: 可选 SourceHealthMonitor，接到 SafetyProbe 做逐路帧计数。
+        """
+        cfg = self.config
+        num = len(self.cameras)
+        out = cfg.get("output")
+
+        p = Pipeline("safety-detector")
+        self._add_sources(p, logger)
+        last_infer = self._add_inference_chain(p)
+        frame_cache = FrameCache()
+        rtsp_mounts = self._add_output_branches(p, out, frame_cache, logger)
+
+        executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="webhook")
+        self.alert_managers = self._build_alert_managers(cfg, executor, logger, frame_cache)
+        vlm_cfg = cfg.get("vlm") or {}
+        if vlm_cfg.get("enabled") and vlm_cfg.get("audit"):
+            from server.alert import vlm_audit   # 空闲期 GPU 巡检，默认关闭
+            vlm_audit.start(frame_cache, self.alert_managers, vlm_cfg)
+            logger.info("vlm-audit 巡检已启用 interval={}s cameras={}",
+                        vlm_cfg.get("audit_interval_s", 90), len(self.alert_managers))
+
+        # 区域标定期排障日志：仅当「本部署真的配了区域」且显式开了 log.out_of_zone
+        # 才逐帧记录「违规成立但在区域外被淘汰」——现场用来区分「模型没检出」与
+        # 「检出后被区域门挡下」。默认关，未配区域的路径完全零开销。
+        log_cfg = cfg.get("log") or {}
+        has_zones = any(rule.zones for rule in self.rules.values())
+        out_of_zone = bool(log_cfg.get("out_of_zone", False)) and has_zones
+        if out_of_zone:
+            logger.info("log.out_of_zone=true：区域外淘汰的违规将以 DEBUG 记录（仅标定期开）")
+
+        p.attach(last_infer, Probe("safety-probe", SafetyProbe(
+            self.alert_managers,
+            executor=executor,
+            frame_cache=frame_cache,
+            gies=self.gies, rules=self.rules,
+            person_uid=self.person_uid,
+            person_conf_threshold=self.person_conf_threshold,
+            active_rules_by_source=self._active_rules_by_source(),
+            health=health,
+            mux_width=MUX_WIDTH, mux_height=MUX_HEIGHT,
+            log_out_of_zone=out_of_zone,
+        )))
+        p.attach(last_infer, "measure_fps_probe", name="fps-probe")
+
+        rtsp_server = None
+        if rtsp_mounts:
+            from server.pipeline.rtsp_server import SinglePortRtspServer
+
+            codec = (out or {}).get("codec", "h264")
+            rtsp_server = SinglePortRtspServer(
+                int((out or {}).get("rtsp_port", 8554)), rtsp_mounts, codec=codec)
+            rtsp_server.start()
+            for mount in rtsp_mounts:
+                logger.info("RTSP 输出: rtsp://localhost:{}{}",
+                            (out or {}).get("rtsp_port", 8554), mount)
+
+        return {
+            "pipeline": p,
+            "frame_cache": frame_cache,
+            "executor": executor,
+            "rtsp_server": rtsp_server,
+            "alert_managers": self.alert_managers,
+        }
+
+    # ------------------------------------------------------------------ 源
+    def _add_sources(self, p: Pipeline, logger) -> None:
+        rc = _reconnect_settings(self.config)
+        src_cfg = self.config.get("source") or {}
+        rtsp_protocol = int(src_cfg.get("rtsp_protocol", 4))
+        if rtsp_protocol not in (1, 2, 4, 7):
+            logger.warning("未知 source.rtsp_protocol={}，回退默认 4 (TCP)", rtsp_protocol)
+            rtsp_protocol = 4
+        # 解码侧抽帧：每 N 帧放行 1 帧（1=不抽帧）。全局生效，用于吞吐实验。
+        drop_interval = int(src_cfg.get("drop_frame_interval", 1))
+        if drop_interval > 1:
+            logger.info("source.drop_frame_interval={}（每 {} 帧放行 1 帧）", drop_interval, drop_interval)
+
+        # DS 版本属性差异探测：如 rtsp-reconnect-timeout 在 DS9.0 已被移除
+        supported = _supported_nvurisrcbin_props(logger)
+
+        def src_props(props: dict) -> dict:
+            if supported is None:
+                return props
+            dropped = [k for k in props if k not in supported]
+            for k in dropped:
+                logger.warning("nvurisrcbin 不支持属性 {} (DS 版本差异)，已跳过", k)
+            return {k: v for k, v in props.items() if k not in dropped}
+
+        p.add("nvstreammux", "mux", {
+            "batch-size": len(self.cameras),
+            "width": MUX_WIDTH,
+            "height": MUX_HEIGHT,
+            "batched-push-timeout": 33000,
+            "live-source": 1,
+        })
+        for i, cam in enumerate(self.cameras):
+            # 内置重连参数（有限次数；耗尽后由看门狗触发监督循环整体重建）。
+            # init-rtsp-reconnect-interval 是 DS9.x 的已知回归坑: 发生错误后活跃
+            # 重连间隔会切换到该值，默认 0 = 禁用重连监控，必须显式设置
+            # （NVIDIA 论坛 Regression #377715 官方 workaround）。
+            p.add("nvurisrcbin", f"src{i}", src_props({
+                "uri": cam["rtsp_url"],
+                "select-rtp-protocol": rtsp_protocol,
+                "drop-frame-interval": drop_interval,
+                "rtsp-reconnect-attempts": int(rc["attempts"]),
+                "rtsp-reconnect-timeout": int(rc["timeout"]),
+                "rtsp-reconnect-interval": int(rc["interval"]),
+                "init-rtsp-reconnect-interval": int(max(1, rc["interval"] // 2)),
+                "latency": int(rc["latency"]),
+            }))
+            p.link((f"src{i}", "mux"), ("", "sink_%u"))
+
+    # ------------------------------------------------------------------ 推理链
+    def _add_inference_chain(self, p: Pipeline) -> str:
+        # 顺序：锚点 detector 最先 → 其余整帧 detector → 二级模型（§3.5 约束）
+        ordered = [s for s in self.gies.values() if s.kind == KIND_DETECTOR and not s.is_secondary]
+        ordered += [s for s in self.gies.values() if s.is_secondary]
+
+        prev, last_infer = "mux", None
+        for spec in ordered:
+            ini = anchor_ini_config(
+                Path(_resolve(self.deploy_root, spec.config_path())),
+                base=self.deploy_root,
+                classifier_threshold=(
+                    self.gie_thresholds.get(spec.name) if spec.kind == KIND_CLASSIFIER else None
+                ),
+            )
+            p.add("nvinfer", spec.name, {"config-file-path": ini, "batch-size": len(self.cameras)})
+            p.link(prev, spec.name)
+            last_infer = spec.name
+            qname = f"q-{spec.name}"
+            p.add("queue", qname, {"max-size-buffers": 4})
+            p.link(spec.name, qname)
+            prev = qname
+
+        p.add("nvstreamdemux", "demux")
+        p.link(prev, "demux")
+        return last_infer
+
+    # ------------------------------------------------------------------ 输出分支
+    def _add_output_branches(self, p: Pipeline, out, frame_cache: FrameCache, logger) -> dict[str, str]:
+        codec = (out or {}).get("codec", "h264")
+        enc_factory = "nvv4l2h265enc" if codec == "h265" else "nvv4l2h264enc"
+        parser_factory = "h265parse" if codec == "h265" else "h264parse"
+
+        rtsp_mounts: dict[str, str] = {}
+        for i in range(len(self.cameras)):
+            # 证据支路直接接在 demux 之后，采集**未经 OSD 的原始帧**；违规框/标签由
+            # AlertManager 在 JPEG 编码前用 ObjectMeta.bbox 自行补画。证据与预览彻底
+            # 解耦：既不受 nvdsosd 帧缓存滞后影响（保证告警图必有框），preview 关闭时
+            # 也无需 nvdsosd，省掉每路 GPU OSD 光栅化。
+            tee = add_evidence_capture(p, frame_cache, source_id=i, gpu_id=0, suffix=str(i))
+            p.link(("demux", tee), ("src_%u", ""))
+
+            if not out:
+                continue
+            p.add("nvdsosd", f"osd{i}", {
+                "gpu-id": 0,
+                "process-mode": 1,
+                "display-bbox": 1,
+                "display-text": 1,
+            })
+            p.link(tee, f"osd{i}")
+            shm_socket = f"/tmp/vi_cam_{i}"
+            _clean_stale_shm_sockets(shm_socket, logger)
+            p.add("nvvideoconvert", f"rtsp-conv{i}", {"gpu-id": 0, "compute-hw": 1})
+            p.add("capsfilter", f"rtsp-caps{i}", {
+                "caps": "video/x-raw(memory:NVMM), format=NV12",
+            })
+            p.add(enc_factory, f"enc{i}", {
+                "bitrate": out.get("bitrate", 4000000),
+                "idrinterval": out.get("idrinterval", 30),
+                "insert-sps-pps": 1,
+            })
+            p.add(parser_factory, f"parse{i}")
+            p.add("shmsink", f"shm{i}", {
+                "socket-path": shm_socket,
+                "wait-for-connection": False,
+                "sync": False,
+                "async": 0,
+            })
+            p.link(f"osd{i}", f"rtsp-conv{i}", f"rtsp-caps{i}",
+                   f"enc{i}", f"parse{i}", f"shm{i}")
+            rtsp_mounts[f"{out.get('mount_prefix', '/cam')}/{self.cameras[i]['id']}"] = shm_socket
+        return rtsp_mounts
+
+    # ------------------------------------------------------------------ 告警
+    def _active_rules_by_source(self) -> dict[int, set[str]]:
+        # 没有 active_rules 的摄像头默认跑“基础规则”，不要继承其他摄像头的
+        # __cam__ 按摄像头规则（否则会串参数）。
+        generated = set(
+            ((self.config.get("api_meta") or {}).get("generated_rules") or {}).keys()
+        )
+        defaults = [name for name in self.rules if name not in generated]
+        return {
+            i: set(cam.get("active_rules") or defaults)
+            for i, cam in enumerate(self.cameras)
+        }
+
+    def _build_alert_managers(self, config: dict, executor, logger,
+                              frame_cache) -> dict[int, AlertManager]:
+        webhook_cfg = config.get("webhook") or {}
+        webhook = None
+        if webhook_cfg.get("url"):
+            webhook = WebhookAlerter(
+                url=webhook_cfg["url"],
+                timeout=webhook_cfg.get("timeout", 10),
+                retries=webhook_cfg.get("retries", 2),
+                secret=webhook_cfg.get("secret") or os.environ.get("SAFETY_WEBHOOK_SECRET"),
+            )
+            logger.debug("webhook configured")
+        else:
+            logger.warning("未配置 Webhook URL，告警不会推送")
+
+        active_by_src = self._active_rules_by_source()
+        managers: dict[int, AlertManager] = {}
+        for i, cam in enumerate(self.cameras):
+            names = sorted(active_by_src[i])
+            managers[i] = AlertManager(
+                camera_id=cam["id"],
+                camera_name=cam.get("name", cam["id"]),
+                rules=[self.rules[name] for name in names],
+                webhook=webhook,
+                device_code=cam.get("device_code"),
+                channel_no=cam.get("channel_no"),
+                include_frame=webhook_cfg.get("include_frame", True),
+                vlm=config.get("vlm"),
+                frame_cache=frame_cache,
+                source_id=i,
+            )
+            logger.info("startup camera={} src={} webhook={} active_rules={}",
+                        cam["id"], _mask_url(cam.get("rtsp_url")), bool(webhook), names)
+        return managers
+
+
+def _resolve(base: Path, path: str) -> str:
+    from server.config import resolve_path
+    return resolve_path(base, path)
+
+
+def _mask_url(url: str | None) -> str | None:
+    """日志里隐藏 RTSP 密码，避免交付后凭据进日志。"""
+    if not url or "@" not in url:
+        return url
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parsed = urlsplit(url)
+        if parsed.password is None:
+            return url
+        netloc = f"{parsed.username or ''}:***@{parsed.hostname or ''}"
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    except Exception:
+        return url

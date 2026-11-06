@@ -1,0 +1,440 @@
+model:
+  person_conf_threshold: 0.6
+  gies:
+    person:
+      kind: detector
+      source: models/person/yolo26n.pt
+      uid: 1
+    helmet:
+      kind: detector
+      source: models/helmet/yolo26s_helm_soft_hat_20261105_0925/weights/best.pt
+      uid: 3
+      violation: head
+    harness_cls:
+      kind: classifier
+      source: models/harness/yolo26m_cls_harness_20260817_0547/weights/best.pt
+      uid: 5
+      violation: no_harness
+    vest_cls:
+      kind: classifier
+      source: models/vest/yolo26mcls_ppeVest_20260904_0959/weights/best.pt
+      uid: 6
+      violation: no_vest
+    smoke:
+      kind: detector
+      attach: person
+      source: models/smoke/yolo26m_smoking_20260707_0224/weights/best.pt
+      uid: 7
+      violation: cigarette
+rules:
+  no_helmet:
+    gie: helmet
+    cooldown_seconds: 10
+    min_detection_count: 3
+    attribute_threshold: 0.5
+  no_vest:
+    gie: vest_cls
+    cooldown_seconds: 300
+    min_detection_count: 15
+    attribute_threshold: 0.8
+  no_harness:
+    gie: harness_cls
+    cooldown_seconds: 30
+    min_detection_count: 5
+    attribute_threshold: 0.7
+  smoking:
+    gie: smoke
+    cooldown_seconds: 30
+    min_detection_count: 3
+    attribute_threshold: 0.75
+  intrusion:
+    gie: person
+    trigger: presence
+    cooldown_seconds: 0
+    min_detection_count: 5
+    vacant_frames: 50
+    attribute_threshold: 0.5
+    alert_type: intrusion
+  __cam__2628__43e2c7a7__intrusion:
+    gie: person
+    trigger: presence
+    cooldown_seconds: 0
+    min_detection_count: 5
+    vacant_frames: 50
+    attribute_threshold: 0.5
+    alert_type: intrusion
+    zones:
+    - id: r9-1
+      anchor: feet
+      points:
+      - - 0.2943
+        - 0.3311
+      - - 0.4398
+        - 0.3408
+      - - 0.5252
+        - 0.6883
+      - - 0.5066
+        - 0.9835
+      - - 0.0055
+        - 0.9874
+      - - 0.0044
+        - 0.6981
+    display_name: intrusion
+webhook:
+  url: http://192.168.1.24:6034/protal/ai-alarm/webhook
+  timeout: 10
+  retries: 2
+vlm:
+  enabled: true
+  shadow: true
+  url: http://vllm:8013/v1/chat/completions
+  model: /model/Qwen2.5-VL-7B-Instruct-AWQ
+  rules:
+  - smoking
+  - no_helmet
+  - no_vest
+  sample_ms: 700
+  deadline_ms: 5500
+  timeout: 4
+  pad: 0.15
+  fail_open: true
+  score_gate:
+    rules:
+    - smoking
+    threshold: 0.75
+  audit: false
+  audit_cycle_s: 2
+  audit_dedup_ttl_s: 60
+  audit_workers: 8
+  audit_max_per_cycle: 6
+  audit_dump_dir: temp2/vlm-audit
+cameras:
+- id: '1363'
+  name: Mobile Camera 1363
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1001182
+  enabled: true
+  active_rules:
+  - smoking
+- id: '1384'
+  name: Mobile Camera 1384
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1001204
+  enabled: true
+  active_rules:
+  - smoking
+- id: '1385'
+  name: Mobile Camera 1385
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1001723
+  enabled: true
+  active_rules:
+  - smoking
+- id: '671'
+  name: Mobile Camera 0671
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1000330
+  enabled: true
+  active_rules:
+  - smoking
+- id: '676'
+  name: Mobile Camera 0676
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1000325
+  enabled: true
+  active_rules:
+  - smoking
+- id: '891'
+  name: Mobile Camera 0891
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1000352
+  enabled: true
+  active_rules:
+  - smoking
+- id: '2168'
+  name: ST_FX_DO_WE_2168
+  rtsp_url: rtsp://118.140.234.166:8554/dahua2168
+  enabled: true
+  active_rules:
+  - smoking
+- id: '2172'
+  name: ST_FX_DO_WE_2172
+  rtsp_url: rtsp://118.140.234.166:8554/dahua2172
+  enabled: true
+  active_rules:
+  - smoking
+- id: '1824'
+  name: ZoneC_Outdoor_001(1824)
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1824
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '1825'
+  name: ZoneC_Outdoor_002(1825)
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1825
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '720'
+  name: '720'
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1001722
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '1439'
+  name: '1439'
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1001274
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+- id: '1195'
+  name: '1195'
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1001547
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+- id: '2201'
+  name: '2201'
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1002609
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+- id: '762'
+  name: AI Camera0762
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1002221
+  enabled: true
+  active_rules:
+  - smoking
+- id: '1918'
+  name: Cam 4 - Portion 14 柏力 Carpark (1918)
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1002660
+  enabled: true
+  active_rules:
+  - smoking
+- id: '1485'
+  name: P6 Viaduct (Visible)
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1001505
+  enabled: true
+  active_rules:
+  - smoking
+- id: '670'
+  name: AI Camera0670
+  rtsp_url: rtsp://192.168.1.16:9090/dss/monitor/params?cameraid=1005322%240&substream=1
+  enabled: true
+  active_rules:
+  - no_vest
+- id: '2628'
+  name: AI Camera2628
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003113
+  enabled: true
+  active_rules:
+  - no_helmet
+  - __cam__2628__43e2c7a7__intrusion
+- id: '2633'
+  name: AI Camera2633
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003138
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '2634'
+  name: AI Camera2634
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003139
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '2635'
+  name: AI Camera2635
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003140
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '2636'
+  name: AI Camera2636
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003141
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '880'
+  name: AI Camera0880
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1000363
+  enabled: true
+  active_rules:
+  - no_helmet
+- id: '1096'
+  name: AI Camera1096
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1001052
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '1912'
+  name: AI Camera1912
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1002734
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '1168'
+  name: AI Camera1168
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1001103
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '1731'
+  name: AI Camera1731
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1001816
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '2666'
+  name: AI Camera2666
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003156
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+- id: '2667'
+  name: AI Camera2667
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003157
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+- id: '2668'
+  name: AI Camera2668
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003158
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+- id: '2669'
+  name: AI Camera2669
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003159
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+- id: '2639'
+  name: AI Camera2639
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003143
+  enabled: true
+  active_rules:
+  - no_helmet
+  - smoking
+- id: '1924'
+  name: AI Camera1924
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1002500
+  enabled: true
+  active_rules:
+  - no_helmet
+  - smoking
+- id: '2674'
+  name: AI Camera2674
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003184
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+- id: '2675'
+  name: AI Camera2675
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003183
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+- id: '2676'
+  name: AI Camera2676
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003185
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+- id: '2644'
+  name: AI Camera2644
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003179
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '2740'
+  name: AI Camera2740
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003233
+  enabled: true
+  active_rules:
+  - no_helmet
+- id: '2741'
+  name: AI Camera2741
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003234
+  enabled: true
+  active_rules:
+  - no_helmet
+- id: '2742'
+  name: AI Camera2742
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1003235
+  enabled: true
+  active_rules:
+  - no_helmet
+- id: '500'
+  name: AI Camera500
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1000361
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+- id: '496'
+  name: AI Camera496
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1000362
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+- id: '353'
+  name: AI Camera353
+  rtsp_url: rtsp://118.140.234.166:8554/dahua353
+  enabled: true
+  active_rules:
+  - no_helmet
+source:
+  rtsp_protocol: 4
+  drop_frame_interval: 2
+  reconnect:
+    attempts: 10
+    timeout: 10
+    interval: 10
+    latency: 500
+    stall_seconds: 180
+  health:
+    source_stall_seconds: 300
+    check_interval: 30
+    min_uptime_seconds: 120
+    rebuild_cost_seconds: 900
+    min_rebuild_interval: 1800
+    maintenance_window: '16:04'
+  preserve_bitstream: true
+log:
+  level: INFO
+  file: logs/server.log
+  out_of_zone: false
+api_meta:
+  generated_rules:
+    __cam__2628__43e2c7a7__intrusion:
+      camera_id: '2628'
+      algorithm: intrusion

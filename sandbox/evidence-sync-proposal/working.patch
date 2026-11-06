@@ -1,0 +1,236 @@
+diff --git a/deploy/config.yaml b/deploy/config.yaml
+index bfb5627..805bf82 100644
+--- a/deploy/config.yaml
++++ b/deploy/config.yaml
+@@ -519,3 +519,7 @@ api_meta:
+     __cam__2628__43e2c7a7__intrusion:
+       camera_id: '2628'
+       algorithm: intrusion
++
++# Match alarm boxes to the same downstream video frame. Disable to roll back.
++evidence:
++  sync: true
+diff --git a/server/alert/manager.py b/server/alert/manager.py
+index cb51a5a..dcb9370 100644
+--- a/server/alert/manager.py
++++ b/server/alert/manager.py
+@@ -168,6 +168,7 @@ class AlertManager:
+         vlm: dict | None = None,
+         frame_cache=None,
+         source_id: int | None = None,
++        evidence_sync: bool = False,
+     ):
+         """
+         Args:
+@@ -190,7 +191,8 @@ class AlertManager:
+         # VLM 复核（可选）：vlm.enabled 且规则在 vlm.rules 内才走复核门；
+         # frame_cache/source_id 缺失（如单测外的旧调用方）时复核不可用，自动回退直推。
+         self.vlm = vlm if vlm and vlm.get("enabled") else None
+-        self.frame_cache = frame_cache if self.vlm is not None else None
++        self.frame_cache = frame_cache
++        self.evidence_sync = evidence_sync
+         self.source_id = source_id
+         # 最近一次告警（供控制面状态查询；只在触发时写，热路径无额外开销）
+         self.last_alert_at: str | None = None
+@@ -292,18 +294,27 @@ class AlertManager:
+         # JPEG 编码在 executor 线程，base64/JSON/HTTP 由 daemon 线程 fire-and-forget。
+         # snapshot 为 None 时仍推送（frame_base64=null），保证无证据帧时不丢告警。
+         # 命中 vlm.rules 的规则改走大模型复核线程（内部自取 executor/webhook 推送）。
+-        if self.webhook and self._vlm_review_enabled(rule_name):
++        if self.evidence_sync and self.frame_cache is not None and frame_info is not None:
++            snapshot = self.frame_cache.request(self.source_id, frame_info[0], frame_info[1])
++            logger.info("evidence-match requested camera={} frame={} pts={}",
++                        self.camera_id, frame_info[0], frame_info[1])
++
++        review_enabled = self._vlm_review_enabled(rule_name)
++        # PPE production decisions belong exclusively to the small models.
++        # Shadow review runs independently and never sends a second alarm.
++        observe_only = (alert_type in ("no_helmet", "no_vest") or
++                        (bool((self.vlm or {}).get("shadow", False)) and
++                         rule_name not in (((self.vlm or {}).get("score_gate") or {}).get("rules") or ())))
++        if self.webhook and review_enabled:
+             threading.Thread(
+                 target=self._vlm_review,
+-                args=(rule_name, alert_type, alert_objects, snapshot, iso_timestamp),
++                args=(rule_name, alert_type, alert_objects, snapshot, iso_timestamp, observe_only),
+                 daemon=True,
+                 name=f"vlm-review-{self.camera_id}-{alert_type}",
+             ).start()
+-        elif self.webhook and executor is not None:
+-            executor.submit(
+-                self._build_and_send,
+-                rule_name, alert_type, snapshot, alert_objects, iso_timestamp,
+-            )
++        if self.webhook and (not review_enabled or observe_only) and executor is not None:
++            executor.submit(self._build_and_send, rule_name, alert_type,
++                            snapshot, alert_objects, iso_timestamp)
+ 
+     def _log_evidence_sync(self, alert_type: str, frame_info):
+         """打一条 evidence 同步日志（camera_id / rule / 帧号与 PTS 差）。
+@@ -327,11 +338,11 @@ class AlertManager:
+     # VLM 复核（告警二次确认：连拍四宫格问大模型 yes/no，见 alert/vlm_review.py）
+     # ------------------------------------------------------------------
+     def _vlm_review_enabled(self, rule_name: str) -> bool:
+-        return (self.frame_cache is not None
++        return (self.vlm is not None and self.frame_cache is not None
+                 and rule_name in (self.vlm.get("rules") or ()))
+ 
+     def _vlm_review(self, rule_name: str, alert_type: str, alert_objects: list[ObjectMeta],
+-                    snapshot, iso_timestamp: str):
++                    snapshot, iso_timestamp: str, observe_only: bool = False):
+         """独立 daemon 线程：触发时刻后按规则采连拍人像（吸烟4帧/防护1帧）→ 问大模型 → 按判定推送。
+ 
+         采样等待（≤ deadline）与 VLM HTTP 全部阻塞在本线程，不占检测/executor 线程。
+@@ -381,8 +392,9 @@ class AlertManager:
+                         url, model, vlm_review.build_grid(crops),
+                         vlm_review.PROMPT, timeout)
+             else:                      # PPE：逐人复核（一图多人全进名单），全图红框判人+部位特写判穿戴
+-                frame = snapshot if isinstance(snapshot, np.ndarray) else None
+-                if frame is None:
++                frame = (snapshot.bgr() if hasattr(snapshot, "bgr") else
++                         snapshot if isinstance(snapshot, np.ndarray) else None)
++                if frame is None and not self.evidence_sync:
+                     ef = self.frame_cache.latest(self.source_id)
+                     frame = ef.bgr() if ef is not None else None
+                 if frame is not None:
+@@ -413,6 +425,9 @@ class AlertManager:
+                     round((t_end - t0) * 1000), len(persons),
+                     "-" if avg is None else
+                     f"small={small_score:.3f} vlm={vlm_score:.3f} avg={avg:.3f}")
++        if observe_only:
++            logger.info("vlm-shadow camera={} rule={} production=small-model-only", self.camera_id, alert_type)
++            return
+         review = {"verdict": verdict or "skipped", "model": model,
+                   "frames": len(crops) or len(persons)}
+         if persons:
+@@ -463,10 +478,17 @@ class AlertManager:
+                 # snapshot 是延迟句柄（EvidenceFrame）或 BGR ndarray；前者只在
+                 # 真正编码告警时触发 GPU→CPU，告警稀疏 → 常态零拷贝。
+                 frame_src = snapshot.bgr() if hasattr(snapshot, "bgr") else snapshot
+-                state = self._rule_states.get(rule_name)
+-                zones = state.rule.zones if state is not None else ()
+-                frame = self._render_evidence(frame_src, alert_type, alert_objects, zones)
+-                buffer = simplejpeg.encode_jpeg(frame, quality=85, colorspace='BGR')
++                if frame_src is None:
++                    logger.warning("evidence-match timeout camera={} rule={} sending without image",
++                                   self.camera_id, rule_name)
++                else:
++                    state = self._rule_states.get(rule_name)
++                    zones = state.rule.zones if state is not None else ()
++                    frame = self._render_evidence(frame_src, alert_type, alert_objects, zones)
++                    buffer = simplejpeg.encode_jpeg(frame, quality=85, colorspace='BGR')
++                    if self.evidence_sync:
++                        logger.info("evidence-match encoded camera={} rule={} matched=true",
++                                    self.camera_id, rule_name)
+ 
+             # 3. Fire-and-forget: base64 → JSON → HTTP 全部在独立 daemon 线程
+             threading.Thread(
+diff --git a/server/pipeline/builder.py b/server/pipeline/builder.py
+index 6eb6624..1090832 100644
+--- a/server/pipeline/builder.py
++++ b/server/pipeline/builder.py
+@@ -315,6 +315,7 @@ class PipelineBuilder:
+                 vlm=config.get("vlm"),
+                 frame_cache=frame_cache,
+                 source_id=i,
++                evidence_sync=bool((config.get("evidence") or {}).get("sync", False)),
+             )
+             logger.info("startup camera={} src={} webhook={} active_rules={}",
+                         cam["id"], _mask_url(cam.get("rtsp_url")), bool(webhook), names)
+diff --git a/server/pipeline/frame_cache.py b/server/pipeline/frame_cache.py
+index c87079c..9235a93 100644
+--- a/server/pipeline/frame_cache.py
++++ b/server/pipeline/frame_cache.py
+@@ -35,6 +35,7 @@ FrameCache 用一把锁保护 dict 的 get/set，引用替换是原子的，无
+ from __future__ import annotations
+ 
+ import threading
++from .evidence_sync import EvidenceSync
+ 
+ import cv2
+ import numpy as np
+@@ -72,17 +73,19 @@ class EvidenceFrame:
+     告警稀疏 → 常态下省掉每帧每路的 device→host 拷贝与色彩转换。
+     """
+ 
+-    __slots__ = ("_tensor", "_bgr")
++    __slots__ = ("_tensor", "_bgr", "_convert_lock")
+ 
+     def __init__(self, tensor):
+         self._tensor = tensor
+         self._bgr = None
++        self._convert_lock = threading.Lock()
+ 
+     def bgr(self) -> np.ndarray:
+-        if self._bgr is None:
+-            self._bgr = _tensor_to_bgr(self._tensor)
+-            self._tensor = None  # 转换完成即释放 GPU 引用
+-        return self._bgr
++        with self._convert_lock:
++            if self._bgr is None:
++                self._bgr = _tensor_to_bgr(self._tensor)
++                self._tensor = None
++            return self._bgr
+ 
+ 
+ class FrameCache:
+@@ -91,11 +94,21 @@ class FrameCache:
+     def __init__(self):
+         self._entries: dict[int, tuple[EvidenceFrame, int, int]] = {}
+         self._lock = threading.Lock()
++        self._sync = EvidenceSync()
+ 
+     def set(self, source_id: int, frame: EvidenceFrame,
+             frame_number: int = -1, timestamp: int = 0):
+         with self._lock:
+             self._entries[source_id] = (frame, frame_number, timestamp)
++            self._sync.publish(source_id, frame_number, timestamp, frame)
++
++    def request(self, source_id, frame_number, timestamp, timeout=2.0):
++        with self._lock:
++            item = self._sync.request(source_id, frame_number, timestamp, timeout)
++            entry = self._entries.get(source_id)
++            if entry is not None and entry[1:] == (frame_number, timestamp):
++                self._sync.publish(source_id, frame_number, timestamp, entry[0])
++            return item
+ 
+     def latest(self, source_id: int) -> EvidenceFrame | None:
+         with self._lock:
+@@ -140,7 +153,7 @@ class FrameCaptureRetriever(BufferRetriever):
+             frame_meta = next(iter(buffer.batch_meta.frame_items), None)
+             if frame_meta is not None:
+                 return (int(getattr(frame_meta, "frame_number", -1)),
+-                        int(getattr(buffer, "timestamp", 0) or 0))
++                        int(getattr(frame_meta, "buffer_pts", 0) or 0))
+         except Exception:
+             pass
+         return -1, 0
+diff --git a/server/pipeline/probe.py b/server/pipeline/probe.py
+index a3612d4..5fb6409 100644
+--- a/server/pipeline/probe.py
++++ b/server/pipeline/probe.py
+@@ -273,7 +273,9 @@ class SafetyProbe(BatchMetadataOperator):
+ 
+             manager = self._managers.get(source_id)
+             if manager is not None:
+-                snapshot, frame_info = None, None
++                snapshot = None
++                frame_info = (getattr(frame_meta, "frame_number", -1),
++                              getattr(frame_meta, "buffer_pts", 0), -1, 0)
+                 if self._frame_cache is not None:
+                     entry = self._frame_cache.latest_with_meta(source_id)
+                     if entry is not None:
+diff --git a/tests/test_zones.py b/tests/test_zones.py
+index d8ba49f..f962483 100644
+--- a/tests/test_zones.py
++++ b/tests/test_zones.py
+@@ -94,6 +94,9 @@ class _Batch:
+ 
+ class _Manager:
+     """记录探针投递的 ObjectMeta，并暴露 camera_name。"""
++    def note_low_conf(self, objects):
++        self.low_conf = objects
++
+     def __init__(self, camera_name="cam"):
+         self.camera_name = camera_name
+         self.received = []

@@ -1,0 +1,8 @@
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+26329 [('helmet', 0.737)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+26328 [('helmet', 0.515), ('head', 0.442)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+26323 [('head', 0.742)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+26320 [('helmet', 0.649)]

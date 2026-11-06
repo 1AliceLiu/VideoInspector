@@ -1,0 +1,525 @@
+# =============================================================================
+# 安全帽 / 反光衣 / 安全带检测服务端 配置文件
+# =============================================================================
+# 本文件是「部署根」：所有相对路径（source 等）均相对本文件所在目录解析，
+# 产物统一写入 ./generated/。修改此文件后:
+#   1. python tools/model_build.py --config deploy/config.yaml   # 编译模型产物（增量，--force 全量重建）
+#   2. python -m server.main --config deploy/config.yaml          # 启动服务
+#
+# model.gies 是模型拓扑的单一事实来源，每项声明:
+#   kind      detector(整帧检测) | classifier(二级分类，作用于 person 裁剪框)
+#   attach    二级检测器专用：附属的锚点 gie 名（如 person），声明后该 detector
+#             以 process-mode=2 在锚点检出框上推理（如抽烟检测）；空 = 整帧
+#   source    模型来源 .pt（编译入口，相对本文件所在目录）
+#   uid       gie-unique-id（全局唯一）
+#   violation 报警类标签（只写报警类，如 head/no_vest/no_harness/cigarette；锚点无此字段）
+#             classifier 若 violation 不在 index0，构建工具自动交换输出通道使其落到 class0
+# rules 每条独立状态机（冷却 / 连续帧确认 / 违规置信度门限），gie 引用上面的模型名。
+#   另可选 trigger: presence（区域入侵，只看「区域内有没有人」）+ zones（归一化
+#   多边形，省略=全图判定）；详见 rules 节内注释与 server/alert/regions.py。
+# =============================================================================
+
+model:
+  person_conf_threshold: 0.6     # person 检测置信度门槛，低于视为噪声（不判定、不渲染、不告警）
+  gies:
+    person:                                    # 锚点检测器（不告警）
+      kind: detector
+      source: models/person/yolo26n.pt
+      uid: 1
+
+    helmet:                                    # 安全帽整帧检测
+      kind: detector
+      source: models/helmet/yolo26s_helm_soft_hat_20261105_0925/weights/best.pt
+      uid: 3
+      violation: head                          # head = 未戴帽（报警类）
+
+    harness_cls:                               # 安全带二级分类器
+      kind: classifier
+      source: models/harness/yolo26m_cls_harness_20260817_0547/weights/best.pt
+      uid: 5
+      violation: no_harness                    # 原 index1 → 构建期自动换到 class0
+
+    vest_cls:                                  # 反光衣二级分类器（新模型，修复 §6 预处理脆弱）
+      kind: classifier
+      source: models/vest/yolo26mcls_ppeVest_20260904_0959/weights/best.pt
+      uid: 6
+      violation: no_vest                       # 原 index0，无需交换
+
+    smoke:                                     # 抽烟二级检测器（附属在 person 裁剪框上检测）
+      kind: detector
+      attach: person                           # 二级：裁剪锚点(person)检出框送检
+      source: models/smoke/yolo26m_smoking_20260707_0224/weights/best.pt
+      uid: 7
+      violation: cigarette                     # 单类模型，cigarette 即报警类
+
+# -----------------------------------------------------------------------------
+# 告警规则（每条规则独立状态机；gie 引用 model.gies 的名称）
+#   classifier 的 classifier-threshold 由 attribute_threshold 启动时重写进 INI；
+#   detector 的 attribute_threshold 同时作为空间关联门限。
+#   display_name（可选，预留）：未来用于 OSD/payload 展示名；未配置回退规则名，
+#   当前渲染行为不变（仍用 ASCII 规则名）。
+#   例：no_vest: { gie: vest_cls, ..., display_name: "未穿反光衣" }
+# -----------------------------------------------------------------------------
+rules:
+  no_helmet:
+    gie: helmet
+    cooldown_seconds: 10
+    min_detection_count: 3
+    attribute_threshold: 0.5
+
+  no_vest:
+    gie: vest_cls
+    cooldown_seconds: 300
+    min_detection_count: 15
+    attribute_threshold: 0.8
+
+  no_harness:
+    gie: harness_cls
+    cooldown_seconds: 30
+    min_detection_count: 5
+    attribute_threshold: 0.7
+
+  smoking:
+    gie: smoke
+    cooldown_seconds: 30
+    min_detection_count: 3
+    attribute_threshold: 0.75
+
+  # 区域入侵（presence 型）——**模板规则，当前无摄像头引用**。
+  #   gie: person    锚点检测器（uid=1，已在推理），不引入任何新模型/新引擎
+  #   trigger: presence  区域内出现人员即事件，不看任何违规属性
+  #   zones 故意留空: 区域是「每摄像头×每算法」的属性，由 tools/area_import.py
+  #     经 ConfigStore 生成 __cam__ 实例补上；validate_config 会拒绝「某路激活了
+  #     presence 规则但没有区域」的配置（否则等于全画面任何人都是入侵）。
+  #   vacant_frames: 离开去抖——区域内连续 N 帧无人才算本次事件结束。
+  #     ⚠ 必须大于最差检测闪烁间隔（实测参考: 0.5s 闪烁需 >=20 帧，5 帧压不住）。
+  #   cooldown_seconds: presence 下不是冷却而是「并入窗口」，建议 0；
+  #     事件间最小间隔已由 min_detection_count + vacant_frames 提供。
+  #     一次入侵=一条告警：人持续在场 30 分钟也只报 1 条。
+  intrusion:
+    gie: person
+    trigger: presence
+    cooldown_seconds: 0
+    min_detection_count: 5
+    vacant_frames: 50
+    attribute_threshold: 0.5      # presence 不使用；校验器要求必填，占位
+    alert_type: intrusion
+  # 2628 区域入侵（按摄像头生成，区域 r9-1 来自 2628-area.txt；重标请用 tools/area_import.py）
+  __cam__2628__43e2c7a7__intrusion:
+    gie: person
+    trigger: presence
+    cooldown_seconds: 0
+    min_detection_count: 5
+    vacant_frames: 50
+    attribute_threshold: 0.5
+    alert_type: intrusion
+    zones:
+    - id: r9-1
+      anchor: feet
+      points:
+      - [0.2943, 0.3311]
+      - [0.4398, 0.3408]
+      - [0.5252, 0.6883]
+      - [0.5066, 0.9835]
+      - [0.0055, 0.9874]
+      - [0.0044, 0.6981]
+    display_name: intrusion
+
+# -----------------------------------------------------------------------------
+# Webhook 告警推送（alert_type 为触发的规则名，如 "no_vest"）
+# -----------------------------------------------------------------------------
+webhook:
+  url: "http://192.168.1.24:6034/protal/ai-alarm/webhook"   # 浸泡测试接收端（compose 内网服务名）
+  # 需搭配 --profile soak 启动 alert-receiver；接下游时改为真实完整地址即可
+  timeout: 10                                   # 请求超时（秒）
+  retries: 2                                    # 失败重试次数
+
+# -----------------------------------------------------------------------------
+# VLM 二级复核（吸烟告警大模型门控，见 server/alert/vlm_review.py）
+# shadow=true：只观察不拦截——判定进日志、payload 不附字段、告警照推，
+# 核对一周 verdict 对错后再改 false 启用拦截（灰度方案见 proposals/vlm-review/README.md）。
+# url 用容器网络 DNS 名 vllm（GPU3 全机共享服务，宿主机测试走 127.0.0.1:8013）。
+# -----------------------------------------------------------------------------
+vlm:
+  enabled: true
+  shadow: true
+  url: http://vllm:8013/v1/chat/completions
+  model: /model/Qwen2.5-VL-7B-Instruct-AWQ
+  rules: [smoking, no_helmet, no_vest]   # 复核问题与确认极性见 server/alert/vlm_review.py REVIEWS
+  sample_ms: 700                       # 吸烟时序帧间隔：8 帧覆盖 ~5s 窗口（安全帽/反光衣 1 帧，无采样等待）
+  deadline_ms: 5500                    # 采样兜底：断流/人走出画面时最迟 5.5s 发起终审
+  timeout: 4                           # 单次复核 HTTP 上限（1024×512 宫格 infer 实测 ~0.7s，留余量）
+  pad: 0.15
+  fail_open: true
+  # 分数门控（2026-11-03）：命中的规则不看 shadow，直接按
+  # (小模型属性 conf + 大模型 P(yes))/2 > threshold 决定是否推送；
+  # VLM 不可用（拿不到分数）时按 fail_open 处置（true=照常推送）。
+  score_gate:
+    rules: [smoking]
+    threshold: 0.75
+  audit: false           # 低置信巡检暂停（2026-11-02；恢复改 true + 重启）
+  audit_cycle_s: 2       # 采集周期：每 2 秒收一轮全路低置信框 → 去重 → 线程池审核
+  audit_dedup_ttl_s: 60  # 同一位置 60 秒内只审一次（IoU>0.5 视为同一目标）
+  audit_workers: 8       # 判定并发；实测全画面一轮约 9 框×3 问，1 秒内可消化
+  audit_max_per_cycle: 6 # 每路每轮最多新审框数（防突发灌爆，余量排队下轮）
+  audit_dump_dir: temp2/vlm-audit   # 命中(两级确认)证据图落盘；置空则不要图
+
+# -----------------------------------------------------------------------------
+# 摄像头列表
+# -----------------------------------------------------------------------------
+# 多路 RTSP 输入（引擎为动态 batch，支持任意路数；每路一个 AlertManager）。
+# active_rules 只声明本路要判定/计算/渲染的规则（引用 rules 节的名称）。
+cameras:
+  # smoking
+  - id: "1363"
+    name: "Mobile Camera 1363"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001182"
+    enabled: true
+    active_rules: ["smoking"]
+
+  - id: "1384"
+    name: "Mobile Camera 1384"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001204"
+    enabled: true
+    active_rules: ["smoking"]
+
+  - id: "1385"
+    name: "Mobile Camera 1385"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001723"
+    enabled: true
+    active_rules: ["smoking"]
+
+  - id: "671"
+    name: "Mobile Camera 0671"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1000330"
+    enabled: true
+    active_rules: ["smoking"]
+
+  - id: "676"
+    name: "Mobile Camera 0676"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1000325"
+    enabled: true
+    active_rules: ["smoking"]
+
+  - id: "891"
+    name: "Mobile Camera 0891"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1000352"
+    enabled: true
+    active_rules: ["smoking"]
+  
+  # ppe + smoking YTM 2026.9.10
+  - id: "2168"
+    name: "ST_FX_DO_WE_2168"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua2168"
+    enabled: true
+    active_rules: [ "smoking"]
+  
+  - id: "2172"
+    name: "ST_FX_DO_WE_2172"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua2172"
+    enabled: true
+    active_rules: [ "smoking"]
+
+  # ppe + smoking SWH 2026.9.10
+  - id: "1824"
+    name: "ZoneC_Outdoor_001(1824)"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1824"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]
+  
+  - id: "1825"
+    name: "ZoneC_Outdoor_002(1825)"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1825"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]
+
+  - id: "720"
+    name: "720"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001722"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]
+  
+  - id: "1439"
+    name: "1439"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001274"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
+  - id: "1195"
+    name: "1195"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001547"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
+  - id: "2201"
+    name: "2201"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1002609"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+  
+  - id: "762"
+    name: "AI Camera0762"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1002221"
+    enabled: true
+    active_rules: ["smoking"]
+
+  - id: "1918"
+    name: "Cam 4 - Portion 14 柏力 Carpark (1918)"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1002660"
+    enabled: true
+    active_rules: ["smoking"]
+
+  - id: "1485"
+    name: "P6 Viaduct (Visible)"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001505"
+    enabled: true
+    active_rules: ["smoking"]
+
+  - id: "670"
+    name: "AI Camera0670"
+    rtsp_url: "rtsp://192.168.1.16:9090/dss/monitor/params?cameraid=1005322%240&substream=1"
+    enabled: true
+    active_rules: ["no_vest"]
+
+  - id: "2628"
+    name: "AI Camera2628"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003113"
+    enabled: true
+    active_rules: ["no_helmet", "__cam__2628__43e2c7a7__intrusion"]
+
+  - id: "2633"
+    name: "AI Camera2633"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003138"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]
+
+  - id: "2634"
+    name: "AI Camera2634"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003139"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]    
+
+  - id: "2635"
+    name: "AI Camera2635"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003140"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"] 
+
+  - id: "2636"
+    name: "AI Camera2636"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003141"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]  
+
+  - id: "880"
+    name: "AI Camera0880"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1000363"
+    enabled: true
+    active_rules: ["no_helmet"]
+
+  - id: "1096"
+    name: "AI Camera1096"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001052"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]  
+  
+  - id: "1912"
+    name: "AI Camera1912"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1002734"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]
+
+  - id: "1168"
+    name: "AI Camera1168"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001103"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"]
+
+  - id: "1731"
+    name: "AI Camera1731"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1001816"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"] 
+
+  - id: "2666"
+    name: "AI Camera2666"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003156"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"] 
+
+  - id: "2667"
+    name: "AI Camera2667"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003157"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"] 
+
+  - id: "2668"
+    name: "AI Camera2668"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003158"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"] 
+
+  - id: "2669"
+    name: "AI Camera2669"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003159"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"] 
+
+  - id: "2639"
+    name: "AI Camera2639"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003143"
+    enabled: true
+    active_rules: ["no_helmet", "smoking"]    
+
+  - id: "1924"
+    name: "AI Camera1924"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1002500"
+    enabled: true
+    active_rules: ["no_helmet", "smoking"]  
+
+  - id: "2674"
+    name: "AI Camera2674"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003184"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"] 
+
+  - id: "2675"
+    name: "AI Camera2675"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003183"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
+  - id: "2676"
+    name: "AI Camera2676"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003185"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
+  - id: "2644"
+    name: "AI Camera2644"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003179"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest", "smoking"] 
+
+  - id: "2740"
+    name: "AI Camera2740"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003233"
+    enabled: true
+    active_rules: ["no_helmet"]
+
+  - id: "2741"
+    name: "AI Camera2741"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003234"
+    enabled: true
+    active_rules: ["no_helmet"]
+
+  - id: "2742"
+    name: "AI Camera2742"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1003235"
+    enabled: true
+    active_rules: ["no_helmet"]
+
+  - id: "500"
+    name: "AI Camera500"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1000361"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
+  - id: "496"
+    name: "AI Camera496"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua1000362"
+    enabled: true
+    active_rules: ["no_helmet", "no_vest"]
+
+  - id: "353"
+    name: "AI Camera353"
+    rtsp_url: "rtsp://118.140.234.166:8554/dahua353"
+    enabled: true
+    active_rules: ["no_helmet"]
+# -----------------------------------------------------------------------------
+# RTSP 输入
+# -----------------------------------------------------------------------------
+# rtsp_protocol: 输入传输协议（nvurisrcbin select-rtp-protocol）
+#   4 = TCP（推荐） | 1 = UDP | 2 = UDP-MCAST | 7 = 自动
+#
+# reconnect: RTSP 断流自愈（Plan A + B）
+#   attempts       nvurisrcbin 内置重连次数上限。必须为有限值：DS7.x 上内置重连
+#                  在网络闪断后可能永久卡死，-1 无限重试只会空转死循环。
+#                  耗尽后该路进入"零信号僵尸态"，由 health 看门狗逐路发现并重建。
+#   timeout        多少秒无数据包判定断流（5s 偏激进易误判，推荐 10s）
+#   interval       重连尝试间隔秒数（过长拖慢恢复，过短形成重连风暴）
+#   latency        jitterbuffer 缓冲 ms；过大延迟断流判定，500 通常够用
+#   stall_seconds  看门狗阈值：出现重连后连续这么久无健康帧心跳，则判定管线
+#                  不可恢复 → 子进程退出(exitcode=2) → 主进程整体重建管线
+#
+# health: 逐路健康监控（Phase 1，server/pipeline/health.py）
+#   SafetyProbe 按帧的 source_id 统计每路最近出帧时刻，发现 DS 内置重连
+#   看不见的"僵尸路"（不重连、不报错、但也不再出帧）。
+#   优化模型 = 带切换成本的在线区间覆盖: min(K·|R| + α·Σ未覆盖时长)，
+#   相机动态上下线不可预知，用代价累积决定何时花一次重建代价。
+#   source_stall_seconds    该路超过 N 秒无帧 → stalled（未覆盖起点，恢复即清零）
+#   check_interval          巡检周期秒数
+#   min_uptime_seconds      子进程启动预热期，期内不判定（源连接需要时间）
+#   rebuild_cost_seconds    代价阈值 K: 累积未覆盖 W=Σ未覆盖秒 ≥ K 且距上次
+#                           重建 ≥ min_rebuild_interval → 重建。
+#                           单路断 ~15min 攒够；两路 ~7.5min——多路断自动加速
+#   min_rebuild_interval    防风暴硬地板: 相机仍离线时 W 会重新累积，
+#                           但最快按此间隔重试"相机已回归"的拾取
+#   maintenance_window      网关每日定时重启的 UTC 时刻（北京时间 00:04
+#                           = UTC 16:04），窗口 ±5min 内只积累不动手，窗口后
+#                           一并结算——计划内重启顺延收编窗口期上线相机
+#                           （stalled 路数 ≥ 一半则绕过 W/间隔立即升级）
+#   maintenance_window      网关每日定时重启的 UTC 时刻（北京时间 00:04
+#                           = UTC 16:04），窗口 ±5min 内只记录不动作
+source:
+  rtsp_protocol: 4
+  # 解码侧抽帧（全局）：每 N 帧只放行 1 帧。1=不抽帧（默认）；吞吐实验时改 2 / 4。
+  # 由 builder 注入 nvurisrcbin drop-frame-interval，N 倍降低 decode→infer→OSD/appsink 负载。
+  drop_frame_interval: 2
+  reconnect:
+    attempts: 10
+    timeout: 10
+    interval: 10
+    latency: 500
+    stall_seconds: 180
+  health:
+    source_stall_seconds: 300
+    check_interval: 30
+    min_uptime_seconds: 120
+    rebuild_cost_seconds: 900
+    min_rebuild_interval: 1800
+    maintenance_window: "16:04"
+
+# -----------------------------------------------------------------------------
+# RTSP 输出（已关闭实时预览：整节注释）
+# 关闭后 builder 跳过每路 nvvideoconvert/capsfilter/encoder/parser/shmsink，
+# 也不再启动 RTSP server；nvdsosd + 证据 appsink 保留，告警证据不受影响。
+# -----------------------------------------------------------------------------
+# output:
+#   rtsp_port: 8554
+#   mount_prefix: /cam
+#   codec: h264
+#   bitrate: 4000000
+#   idrinterval: 30
+
+# -----------------------------------------------------------------------------
+# 日志参数
+# -----------------------------------------------------------------------------
+log:
+  level: "INFO"
+  file: "logs/server.log"
+  # out_of_zone: 区域标定期排障开关。true 时逐条 DEBUG 记录「违规成立但人在区域外
+  # 而被淘汰」的命中，用于区分「模型没检出」与「检出后被区域门挡下」。
+  # 仅在配置了区域的路上有意义，且逐帧写日志 —— 标定完请关掉恢复 INFO。
+  out_of_zone: false
+
+# 控制面元数据：__cam__ 生成规则回指基础算法（勿删，否则 API 视图丢失 intrusion）
+api_meta:
+  generated_rules:
+    __cam__2628__43e2c7a7__intrusion:
+      camera_id: '2628'
+      algorithm: intrusion
+
+# Match alarm boxes to the same downstream video frame. Disable to roll back.
+evidence:
+  sync: true

@@ -1,0 +1,40 @@
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+old 640 26329 [('helmet', 0.869)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+old 640 26328 [('helmet', 0.866)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+old 640 26323 [('helmet', 0.728)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+old 640 26320 []
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+old 640 26384 []
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+old 960 26329 [('helmet', 0.89)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+old 960 26328 [('helmet', 0.864)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+old 960 26323 [('helmet', 0.887)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+old 960 26320 []
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+old 960 26384 []
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+new 640 26329 [('helmet', 0.815)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+new 640 26328 [('helmet', 0.736)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+new 640 26323 [('head', 0.736)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+new 640 26320 [('helmet', 0.582)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+new 640 26384 []
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+new 960 26329 [('head', 0.7)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+new 960 26328 [('head', 0.811)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+new 960 26323 [('head', 0.827)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+new 960 26320 [('head', 0.72)]
+WARNING ⚠️ 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+new 960 26384 [('head', 0.792)]

@@ -1,0 +1,9 @@
+services:
+  detector:
+    image: safety-detector:video-integrity-candidate
+    pull_policy: never
+    volumes:
+    - type: bind
+      source: /home/pzq/projects/VideoInspector/sandbox/video-distortion/candidate-config.yaml
+      target: /app/deploy/config.yaml
+      read_only: true
