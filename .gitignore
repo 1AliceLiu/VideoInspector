@@ -30,3 +30,4 @@ deploy/runtime/
 *.jpg
 *.csv
 *.json
+sandbox

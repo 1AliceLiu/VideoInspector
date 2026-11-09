@@ -1,0 +1,63 @@
+name: video-inspector
+
+services:
+  detector:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: safety-detector:latest
+    pull_policy: build
+    container_name: safety-detector
+    privileged: true
+    ipc: host                  # 对齐开发容器的共享内存机制（NVMM 跨进程内存）
+    shm_size: "2g"
+
+    # ===== 复刻 DevContainer 底层 `--gpus all` 的 CDI 挂载机制 =====
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all   # 开放包括 decoder/encoder 在内的全量能力
+
+    volumes:
+      - ./config.yaml:/app/deploy/config.yaml:ro
+      - ./models:/app/deploy/models:ro
+      - ./generated:/app/deploy/generated
+      - ./logs:/app/deploy/logs
+      - ../temp2:/app/temp2                # 巡检命中证据图落盘（vlm.audit_dump_dir）
+
+    ports:
+      - "18003:8554/tcp"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - safety-net
+
+    restart: unless-stopped
+
+  alert-receiver:
+    image: python:3.11-slim
+    container_name: alert-receiver
+    profiles: ["soak"]
+    working_dir: /app
+    command: >
+      sh -c "pip install --no-cache-dir loguru==0.7.3 &&
+             python3 -u /app/receiver.py --port 9999 --save-dir /app/alerts"
+    volumes:
+      - ../local/webhook_receiver.py:/app/receiver.py:ro
+      - ./alerts:/app/alerts
+    networks:
+      - safety-net
+    restart: unless-stopped
+
+networks:
+  safety-net:
+    driver: bridge

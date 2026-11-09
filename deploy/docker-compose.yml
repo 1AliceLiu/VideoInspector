@@ -43,6 +43,84 @@ services:
 
     restart: unless-stopped
 
+  # ==========================================================================
+  # 双 GPU 双实例（split profile；默认不启动，旧 detector 保持默认与回退）
+  #   启动：docker compose --profile split up -d detector-a detector-b（顺序启动）
+  #   回退：docker compose stop detector-a detector-b && docker compose up -d detector
+  # 注意：privileged 会暴露全部 GPU，计算卡必须用 CUDA_VISIBLE_DEVICES 钉住；
+  #       device_ids 在此模式下无效。generated/ 由两实例共享，启动请间隔 20~30s，
+  #       避免同时重写 labels/INI（运行期只读，无冲突）。
+  # ==========================================================================
+  detector-a:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: safety-detector:latest
+    pull_policy: build
+    container_name: safety-detector-a
+    profiles: ["split"]
+    privileged: true
+    ipc: host
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0        # A 侧计算卡：物理 GPU0
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - SAFETY_CONFIG=/app/deploy/config.a.yaml
+    volumes:
+      - ./config.a.yaml:/app/deploy/config.a.yaml:ro
+      - ./models:/app/deploy/models:ro
+      - ./generated:/app/deploy/generated
+      - ./logs:/app/deploy/logs
+      - ../temp2:/app/temp2
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - safety-net
+    restart: unless-stopped
+
+  detector-b:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: safety-detector:latest
+    pull_policy: build
+    container_name: safety-detector-b
+    profiles: ["split"]
+    privileged: true
+    ipc: host
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=1        # B 侧计算卡：物理 GPU1
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - SAFETY_CONFIG=/app/deploy/config.b.yaml
+    volumes:
+      - ./config.b.yaml:/app/deploy/config.b.yaml:ro
+      - ./models:/app/deploy/models:ro
+      - ./generated:/app/deploy/generated
+      - ./logs:/app/deploy/logs
+      - ../temp2:/app/temp2
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - safety-net
+    restart: unless-stopped
+
   alert-receiver:
     image: python:3.11-slim
     container_name: alert-receiver
