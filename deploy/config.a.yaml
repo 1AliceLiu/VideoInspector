@@ -29,8 +29,8 @@ model:
 rules:
   no_helmet:
     gie: helmet
-    cooldown_seconds: 10
-    min_detection_count: 3
+    cooldown_seconds: 60
+    min_detection_count: 8
     attribute_threshold: 0.5
   no_vest:
     gie: vest_cls
