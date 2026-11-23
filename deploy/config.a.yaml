@@ -17,7 +17,7 @@ model:
       violation: no_harness
     vest_cls:
       kind: classifier
-      source: models/vest/yolo26mcls_ppeVest_20260904_0959/weights/best.pt
+      source: models/vest/E3_yolo26s-cls_448px_s20261117_E2_conservative_nosuit_black_20261118_105021/weights/E3_yolo26s-cls_448px_s20261117_E2_conservative_nosuit_black_deploy.pt
       uid: 6
       violation: no_vest
     smoke:

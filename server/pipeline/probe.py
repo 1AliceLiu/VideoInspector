@@ -69,6 +69,20 @@ _HIDE_TEXT = b""
 # 分类器置信度解析失败时的回退值（payload 展示用，判定由 classifier-threshold 负责）
 CLASSIFIER_FALLBACK_CONF = 0.5
 
+# 合规覆盖（2026-11-09）：head 与 helmet 在头部区域并发时，若 helmet 置信度达标且
+# 覆盖 head 框面积 >= _COMPLIANT_COVER，按 helmet（合规）处理，抑制 head 违规。
+_COMPLIANT_OVERRIDE_CONF = 0.5
+_COMPLIANT_COVER = 0.5
+
+
+def _cover_ratio(inner, outer) -> float:
+    """outer 覆盖 inner 的面积比例（0~1）。用于同一头部上 head/helmet 双框的归属判定。"""
+    ix = max(0.0, min(inner[2], outer[2]) - max(inner[0], outer[0]))
+    iy = max(0.0, min(inner[3], outer[3]) - max(inner[1], outer[1]))
+    inter = ix * iy
+    area = (inner[2] - inner[0]) * (inner[3] - inner[1])
+    return inter / area if area > 0 else 0.0
+
 
 class SafetyProbe(BatchMetadataOperator):
     """逐帧: 按激活规则计算违规 → ObjectMeta 列表 → 对应摄像头的 AlertManager.handle()。
@@ -173,11 +187,14 @@ class SafetyProbe(BatchMetadataOperator):
                 o.rect_params.border_width = _HIDE_BOX
                 o.text_params.display_text = _HIDE_TEXT
                 if uid in active_detector_uids:
+                    left = o.rect_params.left
+                    top = o.rect_params.top
                     detector_boxes[uid].append((
                         getattr(o, "label", ""),
                         o.confidence,
-                        o.rect_params.left + o.rect_params.width / 2,
-                        o.rect_params.top + o.rect_params.height / 2,
+                        left + o.rect_params.width / 2,
+                        top + o.rect_params.height / 2,
+                        (left, top, left + o.rect_params.width, top + o.rect_params.height),
                     ))
 
             # 第二趟: 每个 person → ObjectMeta（违规进 attributes）+ 渲染决策
@@ -302,16 +319,26 @@ class SafetyProbe(BatchMetadataOperator):
 
     @staticmethod
     def _match_violation(obj, boxes, violation_label, conf_threshold):
-        """中心点落在 person 框内、label==violation、置信度达标的框 → 最高置信度（无则 None）。"""
+        """中心点落在 person 框内、label==violation、置信度达标的框 → 最高置信度（无则 None）。
+
+        2026-11-09 新增合规覆盖：同一头部区域若同时存在高置信合规框（helmet≥0.5），
+        按合规处理（抑制 head），避免软帽模型在硬帽上并发 head+helmet 双框造成误报。
+        说明：当前只有 helmet 检测器是「1 违规类 + 1 合规类」，故用 label!=violation
+        认定合规类；多违规类模型需要改为显式配置合规类。
+        """
         px1 = obj.rect_params.left
         py1 = obj.rect_params.top
         px2 = px1 + obj.rect_params.width
         py2 = py1 + obj.rect_params.height
         best = None
-        for label, conf, cx, cy in boxes:
+        compliant = [b for b in boxes
+                     if b[0] != violation_label and b[1] >= _COMPLIANT_OVERRIDE_CONF]
+        for label, conf, cx, cy, rect in boxes:
             if label != violation_label or conf < conf_threshold:
                 continue
             if px1 <= cx <= px2 and py1 <= cy <= py2:
+                if any(_cover_ratio(rect, c[4]) >= _COMPLIANT_COVER for c in compliant):
+                    continue          # 头上有高置信硬帽 → 按 helmet 处理
                 if best is None or conf > best:
                     best = conf
         return best

@@ -31,3 +31,5 @@ deploy/runtime/
 *.csv
 *.json
 sandbox
+temp2/
+temp/

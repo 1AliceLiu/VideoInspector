@@ -59,3 +59,26 @@ cp docker-compose.yml.pre-split.bak-20261109 docker-compose.yml
 - 预览输出当前未启用；若启用，需给 A/B 分配不同宿主端口（当前 compose 未映射端口）。
 - 日志：`deploy/logs/server-a.log`、`server-b.log`（旧实例是 `server.log`）。
 - 单卡 44 路 @960 实测会掉 ~20% FPS 且峰值 87%，已判定不可行；本方案是双卡 22/22。
+
+## 2026-11-09 新增：head/helmet 双框合规覆盖
+
+规则（`server/pipeline/probe.py`）：
+- head 框中心落在 person 内且 conf 达 `attribute_threshold` 后，若同一头部区域存在
+  **conf ≥ 0.5 的 helmet 框**，且该 helmet 框覆盖 head 框面积 **≥ 50%**，
+  则抑制该 head（按 helmet/合规处理，不产生 no_helmet 告警）。
+- 常量：`_COMPLIANT_OVERRIDE_CONF = 0.5`、`_COMPLIANT_COVER = 0.5`；
+- 单测：`tests/test_probe_match.py`（10 用例，含 18 个既有 VLM 用例回归）。
+
+生效方式：已重建镜像 `safety-detector:latest`（ID 16f5a088fc35）并顺序重建 A/B。
+
+回退这条代码改动：
+
+```bash
+cd /home/pzq/projects/VideoInspector
+git checkout -- server/pipeline/probe.py tests/test_probe_match.py
+cd deploy
+docker compose --profile split build detector-a
+docker compose --profile split up -d --no-build detector-a
+sleep 30
+docker compose --profile split up -d --no-build detector-b
+```

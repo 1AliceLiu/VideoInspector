@@ -17,7 +17,7 @@ model:
       violation: no_harness
     vest_cls:
       kind: classifier
-      source: models/vest/yolo26mcls_ppeVest_20260904_0959/weights/best.pt
+      source: models/vest/E3_yolo26s-cls_448px_s20261117_E2_conservative_nosuit_black_20261118_105021/weights/E3_yolo26s-cls_448px_s20261117_E2_conservative_nosuit_black_deploy.pt
       uid: 6
       violation: no_vest
     smoke:
@@ -236,6 +236,22 @@ cameras:
   enabled: true
   active_rules:
   - no_helmet
+- id: '1454'
+  name: '1454'
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1001304
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
+- id: '1453'
+  name: '1453'
+  rtsp_url: rtsp://118.140.234.166:8554/dahua1001485
+  enabled: true
+  active_rules:
+  - no_helmet
+  - no_vest
+  - smoking
 source:
   rtsp_protocol: 4
   drop_frame_interval: 2
