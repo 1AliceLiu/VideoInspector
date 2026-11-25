@@ -33,10 +33,26 @@ docker compose ps
 ```
 
 先确保 `SAFETY_API_KEY` 已设置（compose 从当前 shell 或 `deploy/.env` 读取）。
-API 监听宿主机 `18083`，UFW 需放行；当前对外地址为：
+API 只监听宿主机回环地址 `127.0.0.1:18083`，通过现有 nginx 18081 的
+`/video-inspector/` 反向代理对外：
 
 ```text
-http://118.140.130.26:18083/v1
+http://118.140.130.26:18081/video-inspector/v1
+```
+
+nginx 片段（放在 18081 站点 server 内，静态 `location /` 之前）：
+
+```nginx
+location ^~ /video-inspector/ {
+    proxy_pass http://127.0.0.1:18083/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    client_max_body_size 2m;
+    proxy_read_timeout 120s;
+}
 ```
 
 本地验证：
@@ -44,12 +60,6 @@ http://118.140.130.26:18083/v1
 ```bash
 curl -H "Authorization: Bearer $SAFETY_API_KEY" \
   http://127.0.0.1:18083/v1/cameras/1195
-```
-
-UFW 放行：
-
-```bash
-ufw allow 18083/tcp comment 'VideoInspector Nanjing API'
 ```
 
 B2 写路径：
