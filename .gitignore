@@ -26,6 +26,12 @@ package/logs/*
 # 控制面运行时：revision.json / reload.request / config-history 配置备份
 # ⚠ 备份内含完整 RTSP URL（带凭据），绝不入库
 deploy/runtime/
+deploy/runtime-a/
+deploy/runtime-b/
+deploy/runtime-api/
+deploy/config.a.yaml.bak.*
+deploy/config.b.yaml.bak.*
+deploy/.env
 
 *.jpg
 *.csv

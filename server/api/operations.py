@@ -51,7 +51,8 @@ class OperationStore:
     def create(self, action: str, camera_id: str | None = None,
                candidate: dict | None = None,
                idempotency_key: str | None = None,
-               single_flight: bool = True) -> dict:
+               single_flight: bool = True,
+               node: str | None = None) -> dict:
         with self._lock:
             if idempotency_key:
                 existing = self.find_idempotent(idempotency_key)
@@ -64,6 +65,7 @@ class OperationStore:
                 "operation_id": self._new_id(),
                 "action": action,
                 "camera_id": camera_id,
+                "node": node,
                 "status": "pending",
                 "config_revision": None,
                 "created_at": now_iso(),

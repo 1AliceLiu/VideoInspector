@@ -146,6 +146,9 @@ chmod +x scripts/*.sh
 
 API 默认地址：`http://<服务器IP>:18080`
 
+> 本目录是单实例交付包。当前生产的 A/B 双 GPU 双实例部署、聚合 API 和
+> 写路由见 `../deploy/README.md`。
+
 ### 6.4 确认 API 活着
 
 ```bash

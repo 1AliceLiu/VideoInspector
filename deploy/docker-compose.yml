@@ -55,7 +55,8 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: safety-detector:latest
+    # A 侧当前生产镜像已无 tag；固定新构建 tag，避免误用 B 的旧 latest。
+    image: safety-detector:a-20261125
     pull_policy: build
     container_name: safety-detector-a
     profiles: ["split"]
@@ -74,8 +75,10 @@ services:
       - CUDA_VISIBLE_DEVICES=0        # A 侧计算卡：物理 GPU0
       - NVIDIA_DRIVER_CAPABILITIES=all
       - SAFETY_CONFIG=/app/deploy/config.a.yaml
+      - SAFETY_RUNTIME_DIR=/app/deploy/runtime
     volumes:
       - ./config.a.yaml:/app/deploy/config.a.yaml:ro
+      - ./runtime-a:/app/deploy/runtime
       - ./models:/app/deploy/models:ro
       - ./generated:/app/deploy/generated
       - ./logs:/app/deploy/logs
@@ -109,8 +112,10 @@ services:
       - CUDA_VISIBLE_DEVICES=1        # B 侧计算卡：物理 GPU1
       - NVIDIA_DRIVER_CAPABILITIES=all
       - SAFETY_CONFIG=/app/deploy/config.b.yaml
+      - SAFETY_RUNTIME_DIR=/app/deploy/runtime
     volumes:
       - ./config.b.yaml:/app/deploy/config.b.yaml:ro
+      - ./runtime-b:/app/deploy/runtime
       - ./models:/app/deploy/models:ro
       - ./generated:/app/deploy/generated
       - ./logs:/app/deploy/logs
@@ -119,6 +124,46 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - safety-net
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    image: safety-api:latest
+    pull_policy: build
+    container_name: safety-api
+    profiles: ["split"]
+    environment:
+      - SAFETY_CONFIG_A=/app/deploy/config.a.yaml
+      - SAFETY_CONFIG_B=/app/deploy/config.b.yaml
+      - SAFETY_RUNTIME_A=/app/deploy/runtime-a
+      - SAFETY_RUNTIME_B=/app/deploy/runtime-b
+      - SAFETY_API_RUNTIME_DIR=/app/deploy/runtime-api
+      - SAFETY_MAX_CAMERAS_PER_NODE=32
+      - SAFETY_API_READ_ONLY=0
+      - SAFETY_API_KEY=${SAFETY_API_KEY:-}
+      - SAFETY_API_ALLOW_NO_AUTH=${SAFETY_API_ALLOW_NO_AUTH:-0}
+      - SAFETY_APPLY_TIMEOUT=${SAFETY_APPLY_TIMEOUT:-90}
+      - SAFETY_ICC_RTSP_TEMPLATE=${SAFETY_ICC_RTSP_TEMPLATE:-}
+    volumes:
+      - ./config.a.yaml:/app/deploy/config.a.yaml:rw
+      - ./config.b.yaml:/app/deploy/config.b.yaml:rw
+      - ./runtime-a:/app/deploy/runtime-a
+      - ./runtime-b:/app/deploy/runtime-b
+      - ./runtime-api:/app/deploy/runtime-api
+    ports:
+      - "18083:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
   alert-receiver:

@@ -310,6 +310,62 @@ class ConfigStore:
         self._validate_candidate(raw)
         return raw
 
+    @_locked
+    def append_algorithms(self, camera_id: str, payload) -> dict:
+        if isinstance(payload, dict):
+            algorithms = payload.get("algorithms")
+        else:
+            algorithms = payload
+        if not isinstance(algorithms, list) or not algorithms:
+            raise ApiError(400, "INVALID_ARGUMENT", "algorithms 必须是非空列表")
+
+        raw = self.read()
+        cam = self._find_camera(raw, camera_id)
+        current = self._active_algorithm_entries(raw, cam)
+        existing = {
+            alg_id for alg_id in map(self._algorithm_id, current) if alg_id
+        }
+        for item in algorithms:
+            alg_id = self._algorithm_id(item)
+            if alg_id and alg_id in existing:
+                raise ApiError(
+                    409, "ALGORITHM_ALREADY_BOUND",
+                    f"算法 {alg_id} 已绑定；修改参数请用 PUT /v1/cameras/{camera_id}/algorithms",
+                )
+        self._set_algorithms(raw, cam, current + list(algorithms))
+        self._validate_candidate(raw)
+        return raw
+
+    @staticmethod
+    def _algorithm_id(item) -> str | None:
+        if isinstance(item, str):
+            return item
+        if isinstance(item, dict):
+            value = item.get("id")
+            return value if isinstance(value, str) and value else None
+        return None
+
+    def _active_algorithm_entries(self, raw: dict, cam: dict) -> list:
+        """保留原 active_rules 形态：普通规则仍是字符串，生成规则带参数。"""
+        rules = raw.get("rules") or {}
+        generated = self._generated_map(raw)
+        active = cam.get("active_rules")
+        if active is None:
+            active = [name for name in rules if name not in generated]
+        view = {
+            item["id"]: item
+            for item in self._camera_view(raw, cam, {})["algorithms"]
+        }
+        entries = []
+        for name in active:
+            info = generated.get(name)
+            if info is None:
+                entries.append(name)
+                continue
+            alg_id = info.get("algorithm") or name
+            entries.append(view.get(alg_id) or {"id": alg_id, "params": {}})
+        return entries
+
     # ---------------------------------------------------------------- 内部
     @staticmethod
     def _generated_map(raw: dict) -> dict:
@@ -556,6 +612,7 @@ class ConfigStore:
             "rtsp_url": mask_rtsp_url(cam.get("rtsp_url")),
             "enabled": bool(cam.get("enabled", True)),
             "algorithms": algorithms,
+            "algorithm_count": len(algorithms),
             "status": {
                 "online": bool(status.get("online", False)),
                 "last_frame_age_seconds": status.get("last_frame_age_seconds"),

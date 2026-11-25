@@ -38,6 +38,7 @@ docker compose ps                           # 应为 detector-a / detector-b 两
 
 ```bash
 cd /home/pzq/projects/VideoInspector/deploy
+docker compose --profile split stop api    # 先停聚合 API
 docker compose stop detector-a detector-b
 docker compose up -d detector              # 旧单实例（config.yaml 未改动）
 docker compose ps                          # 应为 detector Up

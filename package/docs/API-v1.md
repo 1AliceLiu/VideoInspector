@@ -1,10 +1,11 @@
 # 视频检测开放 API v1（待确认）
 
-> 版本：v1.2-draft  
-> 日期：2026-10-27  
-> 状态：根据同事反馈修订，待最终确认  
-> 说明：本文档只定义对外契约，不包含内部实现细节。  
+> 版本：v1.4-draft
+> 日期：2026-11-25
+> 状态：根据同事反馈修订，待最终确认
+> 说明：本文档只定义对外契约，不包含内部实现细节。
 > 当前交付版本 v0.2：已实现摄像头管理、算法绑定、区域限制（zones）与区域入侵（intrusion）、状态查询等接口；classifier 按摄像头 `profile` 暂未开放，详见 `package/README.md`。
+> B2 聚合模式：一个 API 合并 `config.a.yaml` / `config.b.yaml`，摄像头带 `node` 与 `algorithm_count`；支持新建摄像头和追加算法，写操作按摄像头自动路由到 A/B。
 
 ## 0. 接口总览
 
@@ -17,9 +18,47 @@
 | PATCH | `/v1/cameras/{id}` | 修改摄像头 | 202 + operation_id |
 | DELETE | `/v1/cameras/{id}` | 删除摄像头 | 202 + operation_id |
 | PUT | `/v1/cameras/{id}/algorithms` | 全量替换绑定算法及参数 | 202 + operation_id |
+| POST | `/v1/cameras/{id}/algorithms` | 追加算法（保留已有） | 202 + operation_id |
 | GET | `/v1/operations/{id}` | 查询变更结果 | 200 |
 | GET | `/healthz` | 健康检查 | 200 |
 | POST | `/v1/cameras/{id}/probe` | RTSP 探测 | 202 + operation_id |
+
+### 0.1 B2 聚合模式（当前部署）
+
+当前对外地址：`http://118.140.130.26:18083/v1`（HTTP，API Key 鉴权）。
+
+生产环境使用双 GPU 双实例：
+
+- `a` 节点：`config.a.yaml`，`runtime-a`，`safety-detector-a`
+- `b` 节点：`config.b.yaml`，`runtime-b`，`safety-detector-b`
+
+一个 API 合并两个节点：
+
+- `GET /v1/cameras` 返回两节点全部摄像头，摄像头对象带 `node` 字段。
+- `GET /v1/cameras/{id}` 自动在 A/B 中查找。
+- `algorithm_count` 表示该摄像头当前绑定的算法数量。
+- `GET /v1/algorithms` 以 A 为读取源；启动时校验 A/B 算法目录一致，不一致 API 拒绝启动。
+- 每个节点最多 32 路 enabled 摄像头；超过时新建返回 `409 CAPACITY_EXCEEDED`，启动校验也会拒绝超限配置。
+- 写操作按 camera id 自动路由到 A 或 B，只重载目标节点。
+- 新建摄像头可传 `node`；省略时自动放到 enabled 摄像头较少的一侧（平局放 `a`）。
+- 全局同一时刻只允许一个变更，A/B 写操作串行。
+- 跨节点重复 camera id 视为配置错误，API 拒绝启动或返回 `409 DUPLICATE_CAMERA`。
+
+示例：1195 在 A 节点，当前绑定 `no_helmet`、`no_vest`：
+
+```json
+{
+  "id": "1195",
+  "name": "1195",
+  "node": "a",
+  "enabled": true,
+  "algorithm_count": 2,
+  "algorithms": [
+    {"id": "no_helmet", "params": {}},
+    {"id": "no_vest", "params": {}}
+  ]
+}
+```
 
 ## 1. 通用约定
 
@@ -68,6 +107,9 @@
 | 409 | `CAPACITY_EXCEEDED` | 超出摄像头配额 |
 | 409 | `OPERATION_IN_PROGRESS` | 已有变更正在生效 |
 | 409 | `LAST_CAMERA` | 不能删除最后一个启用中的摄像头 |
+| 409 | `DUPLICATE_CAMERA` | 同一 camera id 同时出现在两个节点 |
+| 500 | `CONFIG_MISMATCH` | A/B 节点算法目录不一致 |
+| 501 | `READ_ONLY` | 服务以只读模式启动（`SAFETY_API_READ_ONLY=1`） |
 | 422 | `ALGORITHM_NOT_FOUND` | 算法 ID 不存在 |
 | 422 | `INVALID_PARAM` | 算法参数不合法或该算法不支持该参数 |
 | 422 | `UNSUPPORTED_PARAM` | 参数格式合法，但当前版本未开放（如 classifier profile） |
@@ -185,6 +227,7 @@
   "source_mode": "icc",
   "rtsp_url": "rtsp://user:***@host/stream",
   "enabled": true,
+  "node": "a",
   "algorithms": [
     {
       "id": "no_helmet",
@@ -202,6 +245,7 @@
       }
     }
   ],
+  "algorithm_count": 2,
   "status": {
     "online": true,
     "last_frame_age_seconds": 2,
@@ -224,7 +268,9 @@
 | `source_mode` | string | `direct` / `icc` / `forwarded`，默认 `direct` |
 | `rtsp_url` | string? | RTSP 地址；响应中密码脱敏。`direct`/`forwarded` 必填；`icc` 可省略，由后端拼接 |
 | `enabled` | boolean | 是否接入管线 |
+| `node` | string | 聚合模式下所属节点：`a` / `b` |
 | `algorithms` | object[] | 绑定的算法及按摄像头参数 |
+| `algorithm_count` | integer | 当前绑定的算法数量，等于 `algorithms` 长度 |
 | `status.online` | boolean | 最近 30 秒内是否有帧 |
 | `status.last_frame_age_seconds` | number? | 距最近一帧的秒数；从未出帧为 `null` |
 | `status.fps` | number | 最近 10 秒滚动平均帧率；停用或离线为 `0` |
@@ -250,6 +296,7 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
       "source_mode": "icc",
       "rtsp_url": "rtsp://user:***@host/stream",
       "enabled": true,
+      "node": "a",
       "algorithms": [
         {
           "id": "no_helmet",
@@ -260,6 +307,7 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
           }
         }
       ],
+      "algorithm_count": 1,
       "status": {
         "online": true,
         "last_frame_age_seconds": 2,
@@ -282,8 +330,11 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
 ### `GET /v1/cameras/{id}`
 
 返回单个摄像头对象，结构同第 3 节；不存在返回 `404 NOT_FOUND`。
+聚合模式下自动在 `a` / `b` 节点中查找，并返回 `node`；同一 ID 同时存在于两个节点时返回 `409 DUPLICATE_CAMERA`。
 
 ## 6. 新增摄像头
+
+聚合模式下 `POST /v1/cameras` 支持 `node` 字段；省略时自动选择路数较少的一侧。
 
 ### `POST /v1/cameras`
 
@@ -296,6 +347,7 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
   "source_mode": "icc",
   "rtsp_url": "rtsp://user:pass@host/stream",
   "enabled": true,
+  "node": "a",
   "algorithms": [
     {
       "id": "no_helmet",
@@ -324,6 +376,8 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
 - `source_mode=direct` / `forwarded`：`rtsp_url` 必填。
 - `source_mode=icc`：`device_code` + `channel_no` 必填；`rtsp_url` 可选，传了则以 `rtsp_url` 为准，否则后端按 ICC 模板拼接。
 - `enabled` 默认 `true`。建议接入新摄像头时先传 `false`，`probe` 通过后再 `PATCH` 启用。
+- 聚合模式可传 `"node": "a" | "b"` 指定节点；省略时放到当前 enabled 摄像头较少的一侧（平局放 `a`）。单节点部署忽略该字段。
+- 每个节点默认最多 32 路 enabled 摄像头，超出返回 `409 CAPACITY_EXCEEDED`。
 
 响应 `202`：
 
@@ -361,6 +415,7 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
 说明：
 
 - `enabled:false` 会从管线移除，但保留配置，之后可以重新启用。
+- 聚合模式下重新启用摄像头也受每节点 32 路 enabled 上限约束，超出返回 `409 CAPACITY_EXCEEDED`。
 - 不能把最后一个 enabled 摄像头停用；请先启用另一路。
 - 切换 `source_mode`/`rtsp_url` 会触发重建；建议先 `PATCH enabled:false`，改完 `probe` 通过后再启用。
 - 如果把 `source_mode` 改为 `icc`，可以传 `"rtsp_url": null` 清掉旧的直连地址。
@@ -407,6 +462,52 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
 - 解绑算法不会降低 GPU 占用，所有模型仍在对所有摄像头推理。
 - 参数省略时用算法目录里的默认值；传了则只覆盖该摄像头的该算法。
 - 如果新配置和当前完全一致：仍返回 `202`，但 operation 很快变为 `succeeded`，不写配置、不递增 `config_revision`、不重启管线。
+
+### 追加算法
+
+`POST /v1/cameras/{id}/algorithms`
+
+只追加，不替换。已有算法和参数原样保留，新算法追加到列表末尾。
+
+```json
+{
+  "algorithms": [
+    {
+      "id": "smoking",
+      "params": {
+        "cooldown_seconds": 60,
+        "min_detection_count": 5
+      }
+    }
+  ]
+}
+```
+
+响应 `202`：
+
+```json
+{
+  "operation_id": "op_20261125_0001",
+  "status": "pending",
+  "node": "a"
+}
+```
+
+说明：
+
+- 至少传 1 个算法。
+- 参数校验与 `PUT /v1/cameras/{id}/algorithms` 相同。
+- 算法已存在返回 `409 ALGORITHM_ALREADY_BOUND`，不会静默覆盖参数；改参数请用 `PUT`。
+- 聚合模式下按 camera id 自动写 A 或 B，只重载目标节点。
+- operation 完成后重新查询摄像头，`algorithm_count` 和 `algorithms` 会包含新增项。
+
+示例：给 1195 增加抽烟检测：
+
+```http
+POST /v1/cameras/1195/algorithms
+```
+
+成功后 1195 的 `algorithm_count` 从 2 变为 3。
 
 ### 9.1 参数覆盖规则
 
@@ -473,6 +574,7 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
   "operation_id": "op_20261023_0001",
   "action": "create_camera",
   "camera_id": "1824",
+  "node": "a",
   "status": "succeeded",
   "config_revision": 42,
   "created_at": "2026-10-23T02:15:33Z",
@@ -492,11 +594,11 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
 | `failed` | 执行失败，已回滚 |
 | `rolled_back` | 失败后已恢复到上一版 |
 
-`action`：`create_camera`、`update_camera`、`delete_camera`、`bind_algorithms`、`probe_camera`。
+`action`：`create_camera`、`update_camera`、`delete_camera`、`bind_algorithms`、`append_algorithms`、`probe_camera`。
 
 `result`：仅 `probe_camera` 使用，见第 12 节；其他操作为 `null`。
 
-说明：operation 建议保留 7 天（可调）。
+说明：operation 建议保留 7 天（可调）。聚合模式下 operation 带 `node` 字段，表示变更落在 A 还是 B。
 
 ## 11. 健康检查
 
@@ -506,11 +608,15 @@ Query：`enabled`、`algorithm`、`page`、`page_size`
 {
   "status": "ok",
   "pipeline": "running",
-  "config_revision": 42
+  "config_revision": 42,
+  "nodes": {
+    "a": {"pipeline": "running", "config_revision": 42},
+    "b": {"pipeline": "running", "config_revision": 41}
+  }
 }
 ```
 
-不需要鉴权，供平台探活。
+聚合模式下 `nodes` 给出各节点状态；任一节点未运行则顶层 `pipeline` 为 `degraded`。不需要鉴权，供平台探活。
 
 ## 12. RTSP 探测
 
@@ -613,3 +719,5 @@ Payload：
 | 2026-10-23 | v1-draft | 初稿 |
 | 2026-10-23 | v1.1-draft | 根据反馈：probe 进 v1；增加 `device_code`/`channel_no`、ICC/转发源、按摄像头参数、状态字段、Webhook 签名与 `event_id`；明确单租户 |
 | 2026-10-27 | v1.2-draft | 区域限制（zones）写入契约：区域统一返回 `{id, anchor, points}`，接受平台 `RuleId/Points` 形态；`intrusion` 区域入侵与 `vacant_frames`；告警 `zones` / `attributes[].zone` 字段；交付版本 v0.2 |
+| 2026-11-25 | v1.3-draft | B1 A/B 聚合模式：摄像头增加 `node`、`algorithm_count`；`GET /v1/cameras` 合并 A/B；`GET /healthz` 增加 `nodes`；A/B 算法目录一致性校验与每节点 32 路上限 |
+| 2026-11-25 | v1.4-draft | B2 写路由：新建摄像头支持 `node` 自动放置；新增 `POST /v1/cameras/{id}/algorithms` 追加算法；写操作按 camera id 路由 A/B，全局串行，operation 带 `node` |
