@@ -55,6 +55,8 @@ location ^~ /video-inspector/ {
 }
 ```
 
+改完执行 `nginx -t && nginx -s reload`。
+
 本地验证：
 
 ```bash
